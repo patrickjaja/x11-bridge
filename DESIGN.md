@@ -7,7 +7,7 @@ statically-linkable binary. It is the X11 sibling of `kwin-portal-bridge`
 (KDE/Wayland) and speaks the **same JSON contract** so the JS executor treats
 them interchangeably.
 
-- **Invoked by:** `js/executor_linux.js` in `claude-desktop-bin`, via
+- **Invoked by:** `js/cu_linux_executor.js` in `claude-desktop-extra`, via
   `execFile(bin, [subcommand, ...args])`, reading `JSON.parse(stdout.trim())`.
   The binary name resolves from `$KWIN_PORTAL_BRIDGE_BIN` /
   `globalThis.__cuKwinBridgeBin` / `"kwin-portal-bridge"` today; wiring the X11
@@ -30,7 +30,7 @@ no scale conversion in v0.1.
 ## Subcommand → JSON output contract
 
 Shapes are copied from `kwin-portal-bridge` (`src/model.rs`, `src/capture.rs`,
-`src/kwin.rs`) and verified against the JS reader in `js/executor_linux.js`.
+`src/kwin.rs`) and verified against the JS reader in `js/cu_linux_executor.js`.
 Field-name casing is **not uniform** and must be preserved exactly:
 screenshots/app-refs are camelCase; screens/windows are snake_case (that is how
 the kwin bridge emits them and how the JS reads them).

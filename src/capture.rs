@@ -9,7 +9,7 @@
 //! ## Image format decision
 //!
 //! kwin-portal-bridge emits **JPEG quality 75** (`src/capture.rs`
-//! `encode_resized_jpeg_base64`). The JS reader (`js/executor_linux.js`) never
+//! `encode_resized_jpeg_base64`). The JS reader (`js/cu_linux_executor.js`) never
 //! inspects a mime type: `screenshotResultFromRust` / `zoom` only read
 //! `result.base64`/`width`/`height` and hand the base64 straight to the CU
 //! model. To stay a drop-in substitute for the kwin bridge (the reference the

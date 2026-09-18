@@ -1,7 +1,7 @@
 //! Shared, serde-serializable result types and JSON printing helpers.
 //!
 //! Field names here are the contract with the JS executor
-//! (`js/executor_linux.js` in claude-desktop-bin). They mirror the
+//! (`js/cu_linux_executor.js` in claude-desktop-extra). They mirror the
 //! kwin-portal-bridge JSON shapes 1:1 so the X11 bridge is a drop-in
 //! substitute on X11 sessions. Do NOT rename fields without updating the
 //! JS parser in lockstep.

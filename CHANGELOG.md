@@ -35,5 +35,5 @@ Status: experimental. All subcommands are implemented (capture, XTEST
 pointer/keyboard synthesis, EWMH/ICCCM window queries) and the XTEST-injection
 paths are covered by Xvfb integration tests. Screenshots are JPEG (quality 75,
 matching `kwin-portal-bridge`), encoded with the `image` crate. Wiring the
-binary into `claude-desktop-bin`'s `js/executor_linux.js` is the remaining
+binary into `claude-desktop-extra`'s `js/executor_linux.js` is the remaining
 follow-up.
