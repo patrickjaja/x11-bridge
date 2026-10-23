@@ -33,6 +33,16 @@ connection, does its work, and exits. `session-start`/`session-end` are no-ops
 that report `{"ok":true}` for parity. See [DESIGN.md](DESIGN.md) for the
 no-daemon rationale and the full contract.
 
+## CLI contract v1
+
+x11-bridge implements the Computer Use bridge CLI contract v1 shared by all
+claude-desktop-extra bridges: `doctor` always exits 0 and reports
+`contract`, `bridge`, `version`, `backend`, `session_match`,
+`backend_reachable` and the session keys; `session-end` and `forget-session`
+answer without side effects (X11 has no session daemon or remembered grant);
+every coordinate flag accepts negative values. Specification:
+https://github.com/patrickjaja/claude-desktop-extra/blob/master/docs/computer-use-bridge-contract.md
+
 ## Portability (static musl, incl. NixOS)
 
 `x11-bridge` is **pure Rust with zero C dependencies** - it uses `x11rb`'s

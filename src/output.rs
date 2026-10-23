@@ -135,7 +135,27 @@ pub struct CursorPosition {
     pub y: i32,
 }
 
-/// One probed capability/tool for `doctor`. Free-form; only consumed by humans.
+/// `doctor` output: the CLI contract v1 keys, then the X server details as
+/// extras when the connection worked.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorContract {
+    pub contract: u32,
+    pub bridge: &'static str,
+    pub version: &'static str,
+    pub backend: &'static str,
+    pub session_match: bool,
+    pub backend_reachable: bool,
+    pub backend_error: Option<String>,
+    pub session_supported: bool,
+    pub restore_token_present: bool,
+    pub restore_token_path: Option<String>,
+    pub daemon_running: bool,
+    pub session_socket: Option<String>,
+    #[serde(flatten)]
+    pub details: Option<DoctorReport>,
+}
+
+/// X server details reported by `doctor` when reachable (bridge-specific extras).
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub display: String,

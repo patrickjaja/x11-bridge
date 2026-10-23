@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-23
+
+### Changed
+
+- Computer Use bridge CLI contract v1: `doctor` always exits 0 and leads with
+  `contract`, `bridge`, `version`, `backend`, `session_match`,
+  `backend_reachable`, `backend_error` and the session keys (the X server
+  details follow when reachable). `session-end` now reports
+  `{"ok":true,"ended":false,"daemon":"none"}`.
+
+### Added
+
+- `forget-session` (no-op on X11, no side effects).
+- `tests/contract.rs`: contract checks against the built binary with no display.
+
 ## 2026-07-05
 
 ### Added

@@ -125,6 +125,8 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         foreground: bool,
     },
-    /// End a session lock. On X11 this is a no-op that reports success.
+    /// End a session lock. On X11 there is no daemon, so nothing is ended.
     SessionEnd,
+    /// Forget the remembered screen-sharing grant. X11 has none: a no-op.
+    ForgetSession,
 }
