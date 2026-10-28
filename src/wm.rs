@@ -53,6 +53,7 @@ struct Atoms {
     type_dnd: u32,
     type_popup_menu: u32,
     type_dropdown_menu: u32,
+    net_client_list: u32,
 }
 
 impl Atoms {
@@ -85,6 +86,7 @@ impl Atoms {
             "_NET_WM_WINDOW_TYPE_DND",
             "_NET_WM_WINDOW_TYPE_POPUP_MENU",
             "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+            "_NET_CLIENT_LIST",
         ];
 
         // Fire all intern_atom requests, then collect replies: still bounded
@@ -125,6 +127,7 @@ impl Atoms {
             type_dnd: atoms[22],
             type_popup_menu: atoms[23],
             type_dropdown_menu: atoms[24],
+            net_client_list: atoms[25],
         })
     }
 
@@ -496,17 +499,45 @@ fn build_app_ref_chain(
     }))
 }
 
+/// Pick the EWMH client list to use: `_NET_CLIENT_LIST_STACKING` when it is
+/// non-empty, else `_NET_CLIENT_LIST`, else `None` (caller falls back to the
+/// window tree).
+fn select_client_list(stacking: Vec<Window>, plain: Vec<Window>) -> Option<Vec<Window>> {
+    if !stacking.is_empty() {
+        Some(stacking)
+    } else if !plain.is_empty() {
+        Some(plain)
+    } else {
+        None
+    }
+}
+
+/// Whether `window` is a viewable, non-override-redirect window.
+fn is_viewable_managed(conn: &Conn, window: Window) -> bool {
+    conn.conn
+        .get_window_attributes(window)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|attrs| !attrs.override_redirect && attrs.map_state == MapState::VIEWABLE)
+}
+
 /// The ordered list of managed client windows, bottom-to-top.
 ///
-/// Prefers `_NET_CLIENT_LIST_STACKING` (a full EWMH WM). If that property is
-/// absent — bare X, Xvfb, some minimal WMs — falls back to a `query_tree` of
-/// the root's children, keeping only mapped windows that carry a `WM_CLASS`
-/// (a decent heuristic for "real" application top-levels rather than override
-/// -redirect popups). `query_tree` already returns children bottom-to-top.
+/// Prefers `_NET_CLIENT_LIST_STACKING`. Some WMs (xfwm4) set only
+/// `_NET_CLIENT_LIST`; that list is used next, in the WM's own order (mapping
+/// order, not stacking), so callers that need "topmost"/"frontmost" rely on
+/// `_NET_ACTIVE_WINDOW` there. Only when both are absent (bare X, Xvfb, minimal
+/// WMs) does it fall back to a `query_tree` of the root's children, keeping
+/// mapped windows that carry a `WM_CLASS` (a heuristic for application
+/// top-levels rather than override-redirect popups). A root child without a
+/// `WM_CLASS` is a WM frame of a reparenting WM; its viewable children are
+/// searched one level down for the client. `query_tree` returns children
+/// bottom-to-top.
 fn client_list_stacking(conn: &Conn, atoms: &Atoms) -> Result<Vec<Window>> {
-    let ewmh = get_prop_u32(conn, conn.root, atoms.net_client_list_stacking);
-    if !ewmh.is_empty() {
-        return Ok(ewmh);
+    let stacking = get_prop_u32(conn, conn.root, atoms.net_client_list_stacking);
+    let plain = get_prop_u32(conn, conn.root, atoms.net_client_list);
+    if let Some(list) = select_client_list(stacking, plain) {
+        return Ok(list);
     }
 
     let tree = conn
@@ -516,23 +547,36 @@ fn client_list_stacking(conn: &Conn, atoms: &Atoms) -> Result<Vec<Window>> {
         .reply()
         .context("failed to read the window tree reply")?;
 
+    let has_class = |window: Window| {
+        let (instance, class) = get_wm_class(conn, window);
+        instance.is_some() || class.is_some()
+    };
+
     let mut windows = Vec::new();
     for &child in &tree.children {
-        let attrs = conn
-            .conn
-            .get_window_attributes(child)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok());
-        let Some(attrs) = attrs else { continue };
-        if attrs.override_redirect || attrs.map_state != MapState::VIEWABLE {
+        if !is_viewable_managed(conn, child) {
             continue;
         }
         // Only keep windows that look like application top-levels.
-        let (instance, class) = get_wm_class(conn, child);
-        if instance.is_none() && class.is_none() {
+        if has_class(child) {
+            windows.push(child);
             continue;
         }
-        windows.push(child);
+        // Reparenting WM: the client is a child of the frame window.
+        let inner = conn
+            .conn
+            .query_tree(child)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok());
+        if let Some(inner) = inner {
+            windows.extend(
+                inner
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&c| is_viewable_managed(conn, c) && has_class(c)),
+            );
+        }
     }
     Ok(windows)
 }
@@ -587,8 +631,23 @@ pub fn windows(conn: &Conn) -> Result<Vec<WindowInfo>> {
     Ok(result)
 }
 
-/// Report the currently active (focused/frontmost) app.
-pub fn frontmost_app(conn: &Conn) -> Result<AppRef> {
+/// Map an X11 input-focus value to a window that can be a frontmost app.
+///
+/// `GetInputFocus` reports `None` (0) or `PointerRoot` (1) when no window holds
+/// focus (bare Xvfb), and the root window when nothing but the desktop is
+/// focused. None of those is an app, so they map to `None`.
+fn focus_to_window(focus: Window, root: Window) -> Option<Window> {
+    const POINTER_ROOT: Window = 1;
+    if focus == x11rb::NONE || focus == POINTER_ROOT || focus == root {
+        None
+    } else {
+        Some(focus)
+    }
+}
+
+/// Report the currently active (focused/frontmost) app, or `None` when no
+/// window is active (serialized as JSON `null`).
+pub fn frontmost_app(conn: &Conn) -> Result<Option<AppRef>> {
     let atoms = Atoms::intern(conn)?;
     let active = get_prop_cardinal(conn, conn.root, atoms.net_active_window).filter(|&id| id != 0);
 
@@ -604,17 +663,15 @@ pub fn frontmost_app(conn: &Conn) -> Result<AppRef> {
                 .reply()
                 .context("failed to read input focus reply")?
                 .focus;
-            if focus == 0 || focus == x11rb::NONE {
-                return Err(anyhow!(
-                    "no active window (no _NET_ACTIVE_WINDOW and no input focus)"
-                ));
+            match focus_to_window(focus, conn.root) {
+                Some(window) => window,
+                None => return Ok(None),
             }
-            focus
         }
     };
 
     let props = WindowProps::read(conn, &atoms, window);
-    Ok(props.to_app_ref())
+    Ok(Some(props.to_app_ref()))
 }
 
 /// Report the topmost app whose frame contains the global point `(x, y)`.
@@ -726,6 +783,28 @@ pub fn activate_window(conn: &Conn, window: &str) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_none_pointer_root_and_root_are_not_an_app() {
+        const ROOT: Window = 0x123;
+        assert_eq!(focus_to_window(x11rb::NONE, ROOT), None);
+        assert_eq!(focus_to_window(1, ROOT), None);
+        assert_eq!(focus_to_window(ROOT, ROOT), None);
+        assert_eq!(focus_to_window(0x40_0001, ROOT), Some(0x40_0001));
+    }
+
+    #[test]
+    fn client_list_prefers_stacking_then_plain_then_none() {
+        assert_eq!(select_client_list(vec![1, 2], vec![3]), Some(vec![1, 2]));
+        assert_eq!(select_client_list(vec![], vec![3, 4]), Some(vec![3, 4]));
+        assert_eq!(select_client_list(vec![], vec![]), None);
+    }
+
+    #[test]
+    fn no_frontmost_app_serializes_to_null() {
+        let none: Option<AppRef> = None;
+        assert_eq!(serde_json::to_string(&none).unwrap(), "null");
+    }
 
     #[test]
     fn parse_window_id_accepts_decimal() {

@@ -258,6 +258,62 @@ pub fn keysym_name(name: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
+/// Standard X keysym names (keysymdef.h) for the printable ASCII punctuation
+/// and symbols; each keysym equals its ASCII code. Models send xdotool-style
+/// names such as `ctrl+comma`, so these resolve like the literal character.
+const ASCII_KEYSYM_NAMES: &[(&str, char)] = &[
+    ("space", ' '),
+    ("exclam", '!'),
+    ("quotedbl", '"'),
+    ("numbersign", '#'),
+    ("dollar", '$'),
+    ("percent", '%'),
+    ("ampersand", '&'),
+    ("apostrophe", '\''),
+    ("quoteright", '\''),
+    ("parenleft", '('),
+    ("parenright", ')'),
+    ("asterisk", '*'),
+    ("plus", '+'),
+    ("comma", ','),
+    ("minus", '-'),
+    ("period", '.'),
+    ("slash", '/'),
+    ("colon", ':'),
+    ("semicolon", ';'),
+    ("less", '<'),
+    ("equal", '='),
+    ("greater", '>'),
+    ("question", '?'),
+    ("at", '@'),
+    ("bracketleft", '['),
+    ("backslash", '\\'),
+    ("bracketright", ']'),
+    ("asciicircum", '^'),
+    ("underscore", '_'),
+    ("grave", '`'),
+    ("quoteleft", '`'),
+    ("braceleft", '{'),
+    ("bar", '|'),
+    ("braceright", '}'),
+    ("asciitilde", '~'),
+];
+
+/// Look a keysym name up case-insensitively: the keysym-name table first, then
+/// the ASCII punctuation names.
+fn keysym_by_name_ignore_case(name: &str) -> Option<Keysym> {
+    if let Some((_, value)) = KEYSYM_NAMES
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    {
+        return Some(*value);
+    }
+    ASCII_KEYSYM_NAMES
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|&(_, ch)| ch as Keysym)
+}
+
 /// Resolve a key-spec token (CU name / modifier / literal char / raw keysym
 /// name) to an X11 keysym *value*.
 pub fn keysym_for_name(name: &str) -> Result<Keysym> {
@@ -276,6 +332,10 @@ pub fn keysym_for_name(name: &str) -> Result<Keysym> {
             return Ok(ks.raw());
         }
         bail!("no X11 keysym for character `{ch}` (U+{:04X})", ch as u32);
+    }
+
+    if let Some(value) = keysym_by_name_ignore_case(&resolved) {
+        return Ok(value);
     }
 
     bail!("unsupported key name `{name}` (resolved keysym name `{resolved}`)")
@@ -466,6 +526,33 @@ impl Drop for RemapGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keysym_names_for_punctuation_resolve_like_the_character() {
+        for (name, ch) in ASCII_KEYSYM_NAMES {
+            assert_eq!(
+                keysym_for_name(name).unwrap(),
+                XKeysym::from_char(*ch).raw(),
+                "{name}"
+            );
+        }
+        assert_eq!(keysym_for_name("comma").unwrap(), 0x2c);
+        assert_eq!(keysym_for_name("Period").unwrap(), 0x2e);
+        assert_eq!(keysym_for_name("BRACKETLEFT").unwrap(), 0x5b);
+        assert_eq!(keysym_for_name("asciitilde").unwrap(), 0x7e);
+        assert_eq!(keysym_for_name("space").unwrap(), 0x20);
+        // Existing names stay case-insensitive and exact names keep priority.
+        assert_eq!(keysym_for_name("f5").unwrap(), xkeysym::key::F5);
+        assert_eq!(keysym_for_name("Return").unwrap(), xkeysym::key::Return);
+        assert!(keysym_for_name("nosuchkeyname").is_err());
+    }
+
+    #[test]
+    fn chord_with_keysym_name_base_parses() {
+        let spec = parse_spec("ctrl+comma").unwrap();
+        assert_eq!(spec.base, "comma");
+        assert_eq!(keysym_for_name(&spec.base).unwrap(), 0x2c);
+    }
 
     #[test]
     fn parses_modifier_chord() {

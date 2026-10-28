@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-27
+
+### Fixed
+
+- `frontmost-app` prints `null` when no window holds input focus (`None`,
+  `PointerRoot` or the root window, e.g. a bare Xvfb) instead of a bogus
+  `{"bundleId":"1"}`.
+- `windows` and `app-under-point` fall back to `_NET_CLIENT_LIST` when
+  `_NET_CLIENT_LIST_STACKING` is absent (xfwm4 4.20 on a fresh Xvfb publishes
+  `_NET_CLIENT_LIST` without `_NET_CLIENT_LIST_STACKING`; `windows` returned `[]`). The `query_tree` fallback now also looks one level inside WM
+  frame windows for the client.
+- Key names accept the standard X keysym names for ASCII punctuation and
+  symbols (`ctrl+comma`, `shift+period`, `ctrl+bracketleft`, ...), matched
+  case-insensitively; previously only the literal character (`ctrl+,`) worked.
+
 ## 2026-10-23
 
 ### Changed

@@ -43,7 +43,7 @@ the kwin bridge emits them and how the JS reads them).
 | `zoom --x --y --w --h [--display N]` | `{base64, width, height}` | `zoom` reads `result.base64`/`width`/`height` |
 | `windows` | `[{id, title, geometry, pid, desktop_file_name, resource_class, resource_name, window_role, window_type, is_dock, is_desktop, is_visible, is_minimized, is_normal_window, is_dialog, transient, transient_for, output, stacking_order, is_active, exclude_from_capture, keep_above}]` (snake_case) | `normalizeBundleIdFromWindow`, `dockableWindow`, `findHostMainWindow` read `desktop_file_name`, `resource_class`, `resource_name`, `is_minimized`, `is_visible`, `is_dialog`, `is_normal_window`, `is_active`, `stacking_order`, `output`, `keep_above`, `transient`, `transient_for` |
 | `cursor-position` | `{x, y}` | `getCursorPosition` reads `result.x`/`result.y` |
-| `frontmost-app` | `{bundleId, displayName}` (camelCase) | `commandOutputToAppRef` reads `result.bundleId`/`displayName` |
+| `frontmost-app` | `{bundleId, displayName}` (camelCase), or JSON `null` when no window is active | `_appRefFromCommand` reads `result.bundleId`/`displayName` and maps anything else to no app |
 | `app-under-point --x --y` | `{bundleId, displayName}` | same as above |
 | `activate-window --window <id>` | `{activated: <id>}` (or similar ack object) | `activateWindow` ignores the body (fire-and-forget) |
 | `pointer-move --x --y` | `{action, x, y}` (camelCase) | body ignored |
@@ -190,10 +190,14 @@ without changing its parsing.
   - **`exclude_from_capture` is always `false`** - X11 has no per-window
     capture-exclusion (that is a KWin compositor feature); the field exists only
     for JSON parity with the kwin bridge.
-  - **EWMH-absent fallback:** on bare X / Xvfb / minimal WMs there is no
-    `_NET_CLIENT_LIST_STACKING`. `windows` then falls back to a `query_tree` of
-    the root's children, keeping mapped, non-override-redirect top-levels that
-    carry a `WM_CLASS`; `frontmost-app` falls back to `GetInputFocus`;
+  - **Window-list fallback order:** `windows` and `app-under-point` use
+    `_NET_CLIENT_LIST_STACKING`, else `_NET_CLIENT_LIST` (xfwm4 sets only this
+    one; the WM's own order, not stacking, so frontmost relies on
+    `_NET_ACTIVE_WINDOW`), else a `query_tree` of the root's children (bare X /
+    Xvfb / minimal WMs), keeping mapped, non-override-redirect top-levels that
+    carry a `WM_CLASS` (a root child without one is treated as a WM frame and
+    searched one level down for the client).
+  - **EWMH-absent fallback:** `frontmost-app` falls back to `GetInputFocus` (focus `None`, `PointerRoot` or the root window means no app: it prints `null`);
     `app-under-point` falls back to a `translate_coordinates` child walk. Every
     optional property that is absent maps to `None`/`false` rather than an error,
     so read-only commands never crash on a WM-less display (they return an empty
