@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -9,6 +9,14 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Action for `ax-action`. `set-text` reads the text from stdin, never argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AxActionKind {
+    Click,
+    Focus,
+    SetText,
 }
 
 #[derive(Debug, Subcommand)]
@@ -129,4 +137,40 @@ pub enum Command {
     SessionEnd,
     /// Forget the remembered screen-sharing grant. X11 has none: a no-op.
     ForgetSession,
+    /// Turn accessibility on for a holder process (AT-SPI lease).
+    AxEnable {
+        #[arg(long)]
+        holder_pid: u32,
+    },
+    /// Release the holder's accessibility lease; restores the previous state if last.
+    AxRestore {
+        #[arg(long)]
+        holder_pid: u32,
+    },
+    /// List accessibility elements of a window (AT-SPI).
+    AxFind {
+        #[arg(long)]
+        window: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        title_contains: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        include_hidden: bool,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+        #[arg(long)]
+        max_depth: Option<u32>,
+    },
+    /// Act on an element returned by `ax-find`. `set-text` reads stdin.
+    AxAction {
+        #[arg(long)]
+        scope: String,
+        #[arg(long = "ref")]
+        element_ref: String,
+        #[arg(long, value_enum)]
+        action: AxActionKind,
+    },
 }

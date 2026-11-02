@@ -112,6 +112,7 @@ pub fn contract_report() -> DoctorContract {
         daemon_running: false,
         session_socket: None,
         details,
+        atspi: crate::ax::doctor(),
     }
 }
 

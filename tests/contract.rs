@@ -144,3 +144,84 @@ fn bogus_subcommand_exits_two() {
     let out = run(&["definitely-not-a-command"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn doctor_has_atspi_key_and_never_fails() {
+    let out = run(&["doctor"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_str(stdout(&out).trim()).expect("one JSON value");
+    let atspi = v.get("atspi").expect("atspi key");
+    assert!(atspi["bus"].is_boolean());
+}
+
+#[test]
+fn ax_action_rejects_text_in_argv() {
+    for extra in [["--text", "secret"], ["--text-stdin", "x"]] {
+        let out = run(&[
+            "ax-action",
+            "--scope",
+            "s",
+            "--ref",
+            "r",
+            "--action",
+            "set-text",
+            extra[0],
+            extra[1],
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+    }
+}
+
+#[test]
+fn ax_usage_errors_exit_2() {
+    assert_eq!(run(&["ax-find"]).status.code(), Some(2));
+    assert_eq!(run(&["ax-enable"]).status.code(), Some(2));
+    assert_eq!(
+        run(&[
+            "ax-action",
+            "--scope",
+            "s",
+            "--ref",
+            "r",
+            "--action",
+            "bogus"
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn ax_set_text_invalid_utf8_stdin_exits_2() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let home = std::env::temp_dir().join(format!("x11-bridge-utf8-{}", std::process::id()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_x11-bridge"))
+        .args([
+            "ax-action",
+            "--scope",
+            "s",
+            "--ref",
+            "r",
+            "--action",
+            "set-text",
+        ])
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_RUNTIME_DIR", home.join("run"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn x11-bridge");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&[0xff, 0xfe])
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}

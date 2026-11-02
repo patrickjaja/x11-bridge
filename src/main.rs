@@ -1,3 +1,4 @@
+mod ax;
 mod capture;
 mod cli;
 mod conn;
@@ -21,6 +22,9 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
+            if error.downcast_ref::<ax::UsageError>().is_some() {
+                return ExitCode::from(2);
+            }
             ExitCode::FAILURE
         }
     }
@@ -52,6 +56,46 @@ fn run() -> Result<()> {
 
         Command::Doctor => {
             print_json(&doctor::contract_report())?;
+        }
+        Command::AxEnable { holder_pid } => {
+            print_json(&ax::enable(holder_pid)?)?;
+        }
+        Command::AxRestore { holder_pid } => {
+            print_json(&ax::restore(holder_pid)?)?;
+        }
+        Command::AxFind {
+            window,
+            role,
+            title_contains,
+            all,
+            include_hidden,
+            max_nodes,
+            max_depth,
+        } => {
+            let conn = Conn::connect()?;
+            let windows = wm::windows(&conn)?;
+            let args = ax::FindArgs {
+                window,
+                role,
+                title_contains,
+                all,
+                include_hidden,
+                max_nodes,
+                max_depth,
+            };
+            print_json(&ax::find(&conn, &windows, &args)?)?;
+        }
+        Command::AxAction {
+            scope,
+            element_ref,
+            action,
+        } => {
+            print_json(&ax::action(
+                &scope,
+                &element_ref,
+                action,
+                std::io::stdin().lock(),
+            )?)?;
         }
         Command::Screens => {
             let conn = Conn::connect()?;

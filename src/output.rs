@@ -153,6 +153,8 @@ pub struct DoctorContract {
     pub session_socket: Option<String>,
     #[serde(flatten)]
     pub details: Option<DoctorReport>,
+    /// AT-SPI state; optional extra (consumers treat a missing key as no AX support).
+    pub atspi: cu_atspi::AtspiDoctor,
 }
 
 /// X server details reported by `doctor` when reachable (bridge-specific extras).
