@@ -31,6 +31,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, ImageOrder};
 
 use crate::conn::{Conn, Monitor};
+use crate::mask::{self, Coverage, MaskAtoms, MaskReport, MaskRequest, PxRect, ServerGrab};
 use crate::output::{ScreenshotCapture, ScreenshotResult};
 
 /// Long-edge cap on the encoded image, in physical pixels.
@@ -42,22 +43,27 @@ pub const MAX_PIXELS: u32 = 1_150_000;
 const JPEG_QUALITY: u8 = 75;
 
 /// A packed 8-bit-per-channel RGB image (row-major, no padding).
-struct RgbImage {
-    width: u32,
-    height: u32,
+pub(crate) struct RgbImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// `width * height * 3` bytes, R,G,B per pixel.
-    pixels: Vec<u8>,
+    pub(crate) pixels: Vec<u8>,
 }
 
 /// Capture a full monitor. `display` selects the monitor (default: primary).
-pub fn screenshot(conn: &Conn, display: Option<&str>) -> Result<ScreenshotResult> {
+/// With `mask`, everything but the kept windows is masked (see `mask.rs`).
+pub fn screenshot(
+    conn: &Conn,
+    display: Option<&str>,
+    mask: Option<&MaskRequest>,
+) -> Result<ScreenshotResult> {
     let monitor = conn.resolve_monitor(display)?;
     // Clamp the monitor rect to the root geometry (a monitor can, in principle,
     // extend past the reported root size on a mid-reconfiguration; GetImage
     // would then error). Bail if nothing is left.
     let rect = clamp_to_root(conn, monitor.x, monitor.y, monitor.width, monitor.height)?;
 
-    let rgb = capture_rect(conn, rect)?;
+    let (rgb, mask) = capture_with_mask(conn, rect, mask)?;
     let target = compute_target_dims(monitor.width as u32, monitor.height as u32);
     let encoded = encode_resized_jpeg_base64(&rgb, target)?;
 
@@ -70,19 +76,20 @@ pub fn screenshot(conn: &Conn, display: Option<&str>) -> Result<ScreenshotResult
         display_id: monitor.name,
         origin_x: monitor.x,
         origin_y: monitor.y,
+        mask,
     })
 }
 
 /// Capture a logical region `(x, y, w, h)` within a monitor. Coordinates are
-/// relative to the monitor's top-left.
+/// relative to the monitor's top-left. With `mask`, everything but the kept
+/// windows is masked (see `mask.rs`).
 pub fn zoom(
     conn: &Conn,
     display: Option<&str>,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    region: (i32, i32, i32, i32),
+    mask: Option<&MaskRequest>,
 ) -> Result<ScreenshotCapture> {
+    let (x, y, w, h) = region;
     if w <= 0 || h <= 0 {
         bail!("zoom region must have positive width and height");
     }
@@ -94,18 +101,54 @@ pub fn zoom(
     let region = clamp_region_to_monitor(&monitor, x, y, w, h)?;
     let rect = clamp_to_root(conn, region.0, region.1, region.2, region.3)?;
 
-    let rgb = capture_rect(conn, rect)?;
+    let (rgb, mask) = capture_with_mask(conn, rect, mask)?;
     let target = compute_target_dims(rect.width as u32, rect.height as u32);
-    encode_resized_jpeg_base64(&rgb, target)
+    let mut capture = encode_resized_jpeg_base64(&rgb, target)?;
+    capture.mask = mask;
+    Ok(capture)
+}
+
+/// Capture `rect`; in mask mode, read the window tree and the pixels under one
+/// server grab, then mask everything but the kept windows. Any failure is an
+/// error: no unmasked image leaves this function when masking was requested.
+pub(crate) fn capture_with_mask(
+    conn: &Conn,
+    rect: RootRect,
+    request: Option<&MaskRequest>,
+) -> Result<(RgbImage, Option<MaskReport>)> {
+    let Some(request) = request else {
+        return Ok((capture_rect(conn, rect)?, None));
+    };
+    let atoms = MaskAtoms::intern(conn)?;
+    let (mut rgb, layers, direct_of) = {
+        let _grab = ServerGrab::new(conn)?;
+        let layers = mask::read_layers(conn, &atoms)?;
+        let direct_of = mask::resolve_requested(conn, &layers, request)?;
+        let rgb = capture_rect(conn, rect)?;
+        (rgb, layers, direct_of)
+    };
+    let mut direct = vec![false; layers.len()];
+    for &index in direct_of.iter().flatten() {
+        direct[index] = true;
+    }
+    let kept = mask::decide_kept(&layers, &direct);
+    let coverage = Coverage::build(
+        PxRect::new(rect.x, rect.y, rect.width, rect.height),
+        &layers,
+    )?;
+    coverage.apply(&kept, &mut rgb.pixels)?;
+    let visible = coverage.visible(layers.len());
+    let report = mask::build_report(request, &layers, &direct_of, &kept, &visible);
+    Ok((rgb, Some(report)))
 }
 
 /// A rectangle in X11 root pixels, already validated non-empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RootRect {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+pub(crate) struct RootRect {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
 }
 
 /// Intersect `(x, y, w, h)` with the root window geometry; bail on empty.
@@ -316,6 +359,7 @@ fn encode_resized_jpeg_base64(rgb: &RgbImage, target: (u32, u32)) -> Result<Scre
         base64: base64::engine::general_purpose::STANDARD.encode(&jpeg),
         width: resized.width,
         height: resized.height,
+        mask: None,
     })
 }
 

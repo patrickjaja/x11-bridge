@@ -4,6 +4,9 @@ mod cli;
 mod conn;
 mod doctor;
 mod input;
+mod mask;
+#[cfg(test)]
+mod mask_xvfb_it;
 mod output;
 mod wm;
 
@@ -148,9 +151,17 @@ fn run() -> Result<()> {
             let conn = Conn::connect()?;
             print_json(&wm::activate_window(&conn, &window)?)?;
         }
-        Command::Screenshot { display } => {
+        Command::Screenshot {
+            display,
+            mask: mask_args,
+        } => {
+            let request = mask::MaskRequest::from_cli(mask_args.keep_windows, mask_args.mask_all);
             let conn = Conn::connect()?;
-            print_json(&capture::screenshot(&conn, display.as_deref())?)?;
+            print_json(&capture::screenshot(
+                &conn,
+                display.as_deref(),
+                request.as_ref(),
+            )?)?;
         }
         Command::Zoom {
             display,
@@ -158,9 +169,16 @@ fn run() -> Result<()> {
             y,
             w,
             h,
+            mask: mask_args,
         } => {
+            let request = mask::MaskRequest::from_cli(mask_args.keep_windows, mask_args.mask_all);
             let conn = Conn::connect()?;
-            print_json(&capture::zoom(&conn, display.as_deref(), x, y, w, h)?)?;
+            print_json(&capture::zoom(
+                &conn,
+                display.as_deref(),
+                (x, y, w, h),
+                request.as_ref(),
+            )?)?;
         }
         Command::PointerMove { x, y } => {
             let conn = Conn::connect()?;

@@ -1,4 +1,21 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+/// Mask mode for `screenshot` / `zoom`: paint everything except the kept
+/// windows with a solid fill. Without either flag the capture is unmasked.
+#[derive(Debug, Clone, Default, Args)]
+pub struct MaskArgs {
+    /// Keep this window (an id from `windows`, decimal or 0x-hex); everything
+    /// else is masked. Repeatable.
+    #[arg(long = "keep-window", value_name = "ID", value_parser = parse_window_arg, conflicts_with = "mask_all")]
+    pub keep_windows: Vec<u32>,
+    /// Mask mode with an empty allowlist: every pixel is masked.
+    #[arg(long)]
+    pub mask_all: bool,
+}
+
+fn parse_window_arg(value: &str) -> Result<u32, String> {
+    crate::wm::parse_window_id(value).map_err(|error| error.to_string())
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,6 +64,8 @@ pub enum Command {
     Screenshot {
         #[arg(long)]
         display: Option<String>,
+        #[command(flatten)]
+        mask: MaskArgs,
     },
     /// Capture a logical region within a display and return an executor-style zoom image.
     Zoom {
@@ -60,6 +79,8 @@ pub enum Command {
         w: i32,
         #[arg(long)]
         h: i32,
+        #[command(flatten)]
+        mask: MaskArgs,
     },
     /// Move the pointer to a global point.
     PointerMove {

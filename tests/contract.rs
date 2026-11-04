@@ -225,3 +225,62 @@ fn ax_set_text_invalid_utf8_stdin_exits_2() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn doctor_reports_screenshot_mask_capability() {
+    let out = run(&["doctor"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_str(stdout(&out).trim()).expect("one JSON value");
+    assert_eq!(v["contract"], 1);
+    assert_eq!(v["capabilities"]["screenshot_mask"], true);
+}
+
+#[test]
+fn mask_flags_parse_and_conflict() {
+    let ok: &[&[&str]] = &[
+        &["screenshot", "--keep-window", "12583107", "--help"],
+        &["screenshot", "--mask-all", "--help"],
+        &[
+            "zoom",
+            "--x",
+            "0",
+            "--y",
+            "0",
+            "--w",
+            "1",
+            "--h",
+            "1",
+            "--keep-window",
+            "0xC00003",
+            "--keep-window",
+            "42",
+            "--help",
+        ],
+    ];
+    for args in ok {
+        assert_eq!(run(args).status.code(), Some(0), "{args:?}");
+    }
+    let usage: &[&[&str]] = &[
+        &["screenshot", "--keep-window", "1", "--mask-all"],
+        &["screenshot", "--keep-window", "notanid"],
+        &[
+            "zoom",
+            "--x",
+            "0",
+            "--y",
+            "0",
+            "--w",
+            "1",
+            "--h",
+            "1",
+            "--keep-window",
+        ],
+    ];
+    for args in usage {
+        assert_eq!(run(args).status.code(), Some(2), "{args:?}");
+    }
+    // Mask mode without a display: runtime error, never an image.
+    let out = run(&["screenshot", "--mask-all"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+}

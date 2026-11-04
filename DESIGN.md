@@ -39,8 +39,8 @@ the kwin bridge emits them and how the JS reads them).
 |---|---|---|
 | `doctor` | `{display, server_vendor, protocol_major, protocol_minor, screen_count, extensions:{xtest,randr,xfixes}, keyboard:{min_keycode,max_keycode}}` | human-facing only; not parsed by JS |
 | `screens` | `[{id, name, geometry:{x,y,width,height}, scale, refresh_millihz, is_active, is_primary}]` | `mapRustScreenToDisplay` reads `geometry.*`, `scale`, `is_primary`, `name`, `id` (→ `_bridgeId`) |
-| `screenshot [--display N]` | `{base64, width, height, displayWidth, displayHeight, displayId, originX, originY}` (camelCase) | `screenshotResultFromRust` reads `result.displayWidth`/`displayHeight`/`originX`/`originY` |
-| `zoom --x --y --w --h [--display N]` | `{base64, width, height}` | `zoom` reads `result.base64`/`width`/`height` |
+| `screenshot [--display N] [--keep-window ID]... [--mask-all]` | `{base64, width, height, displayWidth, displayHeight, displayId, originX, originY, mask?}` (camelCase) | `screenshotResultFromRust` reads `result.displayWidth`/`displayHeight`/`originX`/`originY` |
+| `zoom --x --y --w --h [--display N] [--keep-window ID]... [--mask-all]` | `{base64, width, height, mask?}` | `zoom` reads `result.base64`/`width`/`height` |
 | `windows` | `[{id, title, geometry, pid, desktop_file_name, resource_class, resource_name, window_role, window_type, is_dock, is_desktop, is_visible, is_minimized, is_normal_window, is_dialog, transient, transient_for, output, stacking_order, is_active, exclude_from_capture, keep_above}]` (snake_case) | `normalizeBundleIdFromWindow`, `dockableWindow`, `findHostMainWindow` read `desktop_file_name`, `resource_class`, `resource_name`, `is_minimized`, `is_visible`, `is_dialog`, `is_normal_window`, `is_active`, `stacking_order`, `output`, `keep_above`, `transient`, `transient_for` |
 | `cursor-position` | `{x, y}` | `getCursorPosition` reads `result.x`/`result.y` |
 | `frontmost-app` | `{bundleId, displayName}` (camelCase), or JSON `null` when no window is active | `_appRefFromCommand` reads `result.bundleId`/`displayName` and maps anything else to no app |
@@ -73,6 +73,61 @@ primary and active - forcing both flags true - so `--display` selection and the
 JS `isPrimary` display picker both resolve it unambiguously. With two or more
 monitors and no RandR primary, the flags stay driven by RandR and the JS falls
 back to `displays[0]`, which is correct.)
+
+## Mask mode (allowlist-filtered capture)
+
+`screenshot` and `zoom` take `--keep-window <id>` (repeatable; an id from
+`windows`, decimal or `0x`-hex) or `--mask-all` (mask mode with an empty
+allowlist). The two conflict (exit 2). Without either flag the capture and its
+output are unchanged. `doctor` reports `capabilities.screenshot_mask: true`
+(additive; contract stays 1, a missing key means no support).
+
+Every pixel that is not part of a kept window's visible region is painted
+`#1E1E1E`: the desktop, panels, notifications, windows that appear later,
+override-redirect windows of other apps and Claude's own window are masked
+unless kept. A masked window stays a solid rectangle where it is.
+
+Algorithm (`src/mask.rs`):
+
+1. Grab the server; the window tree and the `GetImage` pixels are one snapshot.
+2. `QueryTree(root)` gives the root children in the server's real stacking
+   order. This decides which window owns a root pixel, so it is used instead of
+   `_NET_CLIENT_LIST_STACKING` (no override-redirect windows; absent on xfwm4).
+   Each viewable `InputOutput` child is a layer with its outer geometry (border
+   included). On a reparenting WM the child is the frame, so decorations belong
+   to their window; `_NET_FRAME_EXTENTS` is not needed. A client with
+   `_GTK_FRAME_EXTENTS` (CSD) is reduced to its visible part (no shadow margin).
+3. Each kept id is walked up to its root child. Ids that do not exist or are not
+   viewable are reported in `kept_missing` and masked.
+4. Also kept: transients (`WM_TRANSIENT_FOR`) of a kept window, and
+   override-redirect windows (menus, tooltips, dropdowns) stacked above a kept
+   window with the same `WM_CLIENT_LEADER`, or the same `_NET_WM_PID` and a
+   `WM_CLASS` class that does not differ.
+5. Painter's algorithm: a pixel is kept only when its topmost window is kept. A
+   kept window covered by a masked window is masked there (`GetImage` only has
+   the top pixels).
+
+Fail closed: any error reading the tree exits 1 with no image. A virtual-root
+WM (`__SWM_VROOT`) is refused.
+
+Output adds `mask`:
+`{mode: "keep"|"all", fill: "#1E1E1E", kept: [id], kept_hidden: [id],
+kept_missing: [id], auto_kept: [id], masked: [{id, frame, pid,
+desktop_file_name, resource_class, resource_name, override_redirect}]}`.
+`kept` = requested ids with visible pixels in the image; `kept_hidden` =
+requested, viewable, but no visible pixel (covered, or outside the region);
+`auto_kept` = windows kept through ownership; `masked` = masked windows with
+pixels in the image, topmost first, by client id (as in `windows`). Titles of
+masked windows are never reported.
+
+Limits: geometry is rectangular, so a kept shaped window (non-rectangular
+`SHAPE` region) shows what is under its cut-out corners, and a kept ARGB window
+with a transparent background shows what is behind it, as composited. Under a
+compositing manager the pixels are the compositor's last frame: a window that
+moved or closed within that frame, or a running effect (animation, wobbly
+windows, desktop cube), can leave stale pixels in a kept region. A compositor
+that paints into its own full-screen override-redirect window instead of the
+Composite overlay masks everything.
 
 ## Key-spec grammar
 

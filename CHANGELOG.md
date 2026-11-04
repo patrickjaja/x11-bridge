@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-11-04
+
+### Added
+
+- Mask mode for `screenshot` and `zoom`: `--keep-window <id>` (repeatable) or
+  `--mask-all` paints every pixel outside the kept windows' visible region with
+  `#1E1E1E`. Menus, tooltips and dialogs of a kept window stay visible. The
+  window tree and the pixels are read under one server grab, and any read error
+  fails the command instead of returning an unmasked image. The output gains a
+  `mask` object (kept, hidden, missing and masked windows) and `doctor` reports
+  `capabilities.screenshot_mask: true`.
+
 ## 2026-10-27
 
 ### Fixed

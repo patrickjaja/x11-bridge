@@ -12,7 +12,9 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
 
 use crate::conn::Conn;
-use crate::output::{DoctorContract, DoctorExtensions, DoctorKeyboard, DoctorReport};
+use crate::output::{
+    DoctorCapabilities, DoctorContract, DoctorExtensions, DoctorKeyboard, DoctorReport,
+};
 
 /// Whether the named extension is present on the server.
 ///
@@ -113,6 +115,9 @@ pub fn contract_report() -> DoctorContract {
         session_socket: None,
         details,
         atspi: crate::ax::doctor(),
+        capabilities: DoctorCapabilities {
+            screenshot_mask: true,
+        },
     }
 }
 

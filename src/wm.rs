@@ -726,7 +726,7 @@ pub fn app_under_point(conn: &Conn, x: i32, y: i32) -> Result<AppRef> {
 /// Parse a window id string accepted by `activate-window`. Accepts both decimal
 /// (`"12583107"`, the form `windows` emits) and `0x`-prefixed hex
 /// (`"0xC00003"`), so callers that copy an id from `xwininfo`/`xprop` also work.
-fn parse_window_id(window: &str) -> Result<Window> {
+pub(crate) fn parse_window_id(window: &str) -> Result<Window> {
     let trimmed = window.trim();
     let parsed = if let Some(hex) = trimmed
         .strip_prefix("0x")

@@ -65,6 +65,9 @@ pub struct ScreenshotResult {
     pub display_id: String,
     pub origin_x: i32,
     pub origin_y: i32,
+    /// Mask-mode report; only present with `--keep-window` / `--mask-all`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask: Option<crate::mask::MaskReport>,
 }
 
 /// A region (zoom) capture. Matches kwin-portal-bridge `ScreenshotCapture`
@@ -74,6 +77,9 @@ pub struct ScreenshotCapture {
     pub base64: String,
     pub width: u32,
     pub height: u32,
+    /// Mask-mode report; only present with `--keep-window` / `--mask-all`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask: Option<crate::mask::MaskReport>,
 }
 
 /// A window entry. Field names match kwin-portal-bridge `WindowInfo` and the
@@ -155,6 +161,15 @@ pub struct DoctorContract {
     pub details: Option<DoctorReport>,
     /// AT-SPI state; optional extra (consumers treat a missing key as no AX support).
     pub atspi: cu_atspi::AtspiDoctor,
+    /// Optional features of this build; consumers treat a missing key as false.
+    pub capabilities: DoctorCapabilities,
+}
+
+/// `doctor.capabilities`: additive feature flags (contract stays 1).
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorCapabilities {
+    /// `screenshot`/`zoom` accept `--keep-window <id>` / `--mask-all`.
+    pub screenshot_mask: bool,
 }
 
 /// X server details reported by `doctor` when reachable (bridge-specific extras).
