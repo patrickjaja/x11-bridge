@@ -72,7 +72,9 @@ jobs:
           BIN="target/${{ matrix.target }}/release/x11-bridge"
           echo ">>> file $BIN"
           file "$BIN"
-          if ! file "$BIN" | grep -q "statically linked"; then
+          # Newer file(1) reports "static-pie linked" for a fully-static PIE;
+          # older versions say "statically linked". Accept either.
+          if ! file "$BIN" | grep -qE "statically linked|static-pie linked"; then
             echo "FAIL: $BIN is not statically linked" >&2
             exit 1
           fi

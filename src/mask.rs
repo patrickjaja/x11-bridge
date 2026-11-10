@@ -326,7 +326,7 @@ impl Coverage {
                 self.area.height
             );
         }
-        for (pixel, &owner) in pixels.chunks_exact_mut(3).zip(&self.owners) {
+        for (pixel, &owner) in pixels.as_chunks_mut::<3>().0.iter_mut().zip(&self.owners) {
             if owner == 0 || !kept[usize::from(owner) - 1] {
                 pixel.copy_from_slice(&MASK_FILL);
             }

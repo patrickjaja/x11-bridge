@@ -163,9 +163,10 @@ pub struct DoctorContract {
     pub atspi: cu_atspi::AtspiDoctor,
     /// Optional features of this build; consumers treat a missing key as false.
     pub capabilities: DoctorCapabilities,
-    /// Whether `abort-watch` would arm here (XInput >= 2.1).
+    /// Whether `abort-watch` would arm here (XInput >= 2.1): the crate's
+    /// `{mechanism, available, reason}` plus `consumes`.
     #[serde(rename = "abortWatch")]
-    pub abort_watch: cu_abort_watch::AbortWatchDoctor,
+    pub abort_watch: serde_json::Value,
 }
 
 /// `doctor.capabilities`: additive feature flags (contract stays 1).

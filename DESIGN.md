@@ -223,8 +223,10 @@ Mechanism `xi2`:
   session mechanism, not the Wayland one.
 
 `doctor` adds `"abortWatch": {"available": bool, "mechanism": "xi2",
-"reason": string|null}`: available when the X server is reachable and speaks
-XInput >= 2.1, otherwise the reason.
+"reason": string|null, "consumes": false|null}`: available when the X server is
+reachable and speaks XInput >= 2.1, otherwise the reason. `consumes` says
+whether arming takes Escape from applications: `false` (the XInput2 watcher is
+passive), `null` when unavailable.
 
 ## Error contract
 

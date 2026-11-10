@@ -232,12 +232,21 @@ fn synthetic_safe(xwayland: bool) -> bool {
     !xwayland
 }
 
-/// `doctor`'s `abortWatch` key.
-pub fn doctor() -> AbortWatchDoctor {
-    match connect().and_then(|(conn, _)| check_xi2(&conn)) {
-        Ok(_) => AbortWatchDoctor::available(Mechanism::Xi2),
-        Err(e) => AbortWatchDoctor::unavailable(Some(Mechanism::Xi2), format!("{e:#}")),
-    }
+/// `doctor`'s `abortWatch` key: the crate's `{mechanism, available, reason}`
+/// plus `consumes` (does arming take Escape from applications): `false` when
+/// available, the XInput2 raw-event watcher is passive; `null` when
+/// unavailable.
+pub fn doctor() -> serde_json::Value {
+    let (base, consumes) = match connect().and_then(|(conn, _)| check_xi2(&conn)) {
+        Ok(_) => (AbortWatchDoctor::available(Mechanism::Xi2), Some(false)),
+        Err(e) => (
+            AbortWatchDoctor::unavailable(Some(Mechanism::Xi2), format!("{e:#}")),
+            None,
+        ),
+    };
+    let mut v = base.to_value();
+    v["consumes"] = consumes.into();
+    v
 }
 
 /// All devices, each classified as XTEST or not.

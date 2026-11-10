@@ -403,7 +403,7 @@ fn doctor_reports_abort_watch_available() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         v["abortWatch"],
-        serde_json::json!({"available": true, "mechanism": "xi2", "reason": null})
+        serde_json::json!({"available": true, "mechanism": "xi2", "reason": null, "consumes": false})
     );
 }
 

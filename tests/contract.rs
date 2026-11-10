@@ -293,6 +293,7 @@ fn doctor_reports_abort_watch_unavailable_without_display() {
     assert_eq!(aw["available"], false, "{v}");
     assert_eq!(aw["mechanism"], "xi2");
     assert!(aw["reason"].is_string(), "{v}");
+    assert!(aw["consumes"].is_null(), "{v}");
 }
 
 #[test]
