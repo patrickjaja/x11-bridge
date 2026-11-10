@@ -1,3 +1,4 @@
+mod abort;
 mod ax;
 mod capture;
 mod cli;
@@ -22,7 +23,7 @@ use crate::output::print_json;
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("{error:#}");
             if error.downcast_ref::<ax::UsageError>().is_some() {
@@ -33,7 +34,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -60,6 +61,8 @@ fn run() -> Result<()> {
         Command::Doctor => {
             print_json(&doctor::contract_report())?;
         }
+        // Long-running: the shared crate owns stdout, stdin and the exit code.
+        Command::AbortWatch => return Ok(cu_abort_watch::run(abort::Xi2Backend::new())),
         Command::AxEnable { holder_pid } => {
             print_json(&ax::enable(holder_pid)?)?;
         }
@@ -232,7 +235,7 @@ fn run() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Report the current global cursor position via xproto.

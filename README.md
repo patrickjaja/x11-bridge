@@ -40,7 +40,10 @@ claude-desktop-extra bridges: `doctor` always exits 0 and reports
 `contract`, `bridge`, `version`, `backend`, `session_match`,
 `backend_reachable` and the session keys; `session-end` and `forget-session`
 answer without side effects (X11 has no session daemon or remembered grant);
-every coordinate flag accepts negative values. Specification:
+every coordinate flag accepts negative values. `abort-watch` (Escape stops
+Computer Use) and the `doctor` key `abortWatch` follow the shared
+[`cu-abort-watch`](https://github.com/patrickjaja/cu-abort-watch) contract.
+Specification:
 https://github.com/patrickjaja/claude-desktop-extra/blob/master/docs/computer-use-bridge-contract.md
 
 ## Portability (static musl, incl. NixOS)
@@ -91,7 +94,7 @@ A persistent cache lives in `./.pipeline-cache/`, so re-runs are fast.
 
 ## CLI overview
 
-One-shot subcommands. Each prints a single JSON object/array on stdout; on
+One-shot subcommands (`abort-watch` excepted). Each prints a single JSON object/array on stdout; on
 failure it prints a message to stderr and exits 1 (clap parse errors exit 2).
 
 | Subcommand | Purpose |
@@ -109,6 +112,7 @@ failure it prints a message to stderr and exits 1 (clap parse errors exit 2).
 | `cursor-position` / `frontmost-app` / `app-under-point` | Pointer + app queries |
 | `activate-window --window <id>` | Raise + focus a window |
 | `session-start` / `session-end` | No-ops on X11 (report `{"ok":true}`) |
+| `abort-watch` | Long-running: JSON line `{"event":"abort"}` per physical Escape press (XInput2 raw keys, XTEST input ignored) until stdin closes |
 
 ```sh
 x11-bridge screens

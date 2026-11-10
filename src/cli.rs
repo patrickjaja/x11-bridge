@@ -149,6 +149,9 @@ pub enum Command {
         #[arg(long)]
         duration_ms: u64,
     },
+    /// Watch for the user's Escape (XInput2 raw keys, XTEST ignored) until
+    /// stdin closes. JSON lines on stdout; see DESIGN.md.
+    AbortWatch,
     /// Begin a session lock. On X11 this is a no-op that reports success.
     SessionStart {
         #[arg(long, default_value_t = false)]

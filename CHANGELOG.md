@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-11-10
+
+### Added
+
+- `abort-watch`: long-running watcher for the user's Escape (Escape stops
+  Computer Use). XInput2 raw key events on the root window, passive (the key
+  still reaches the focused window), delivered under other clients' grabs.
+  Escape injected over XTEST (the bridge's own `key-sequence`, `xdotool`) is
+  ignored by source device, so the `ready` line reports `syntheticSafe: true`
+  (`false` on Xwayland). Follows device hotplug, new masters and keymap
+  changes; a lost X connection ends it with an `error` line and exit 1.
+  Protocol from the shared `cu-abort-watch` crate.
+- `doctor` reports `abortWatch` (`available` with XInput >= 2.1, else a
+  `reason`).
+
 ## 2026-11-04
 
 ### Added

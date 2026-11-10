@@ -6,12 +6,15 @@
 # move your cursor and type into your focused window. This wrapper spins up an
 # isolated Xvfb so the injection is harmless.
 #
+# Every suite runs even when an earlier one fails; the script exits non-zero
+# at the end if any failed.
+#
 # Usage:
 #   scripts/test-xvfb.sh                # run all #[ignore]d integration tests
 #   scripts/test-xvfb.sh type_text      # run a single test by name filter
-set -euo pipefail
+set -uo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 if ! command -v xvfb-run >/dev/null 2>&1; then
   echo "error: xvfb-run not found (install xorg-server-xvfb / xvfb)" >&2
@@ -19,10 +22,27 @@ if ! command -v xvfb-run >/dev/null 2>&1; then
 fi
 
 FILTER="${1:-}"
+failed=()
 
 # --ignored runs the #[ignore]d tests; the module is built into the bin target.
 # A single test thread avoids two tests warping the shared virtual pointer at
 # once. `xdotool` inside the same Xvfb is a handy manual oracle but the tests
 # assert via x11rb events directly, so it is not required here.
-xvfb-run -a -s "-screen 0 1280x800x24" \
-  cargo test --bin x11-bridge -- --ignored --test-threads=1 ${FILTER:+"$FILTER"}
+if ! xvfb-run -a -s "-screen 0 1280x800x24" \
+  cargo test --bin x11-bridge -- --ignored --test-threads=1 ${FILTER:+"$FILTER"}; then
+  failed+=("bin x11-bridge (in-crate Xvfb tests)")
+fi
+
+# `abort-watch` drives the built binary (spawned as a child, like Claude
+# Desktop does) and injects "physical" keys through Xvfb's own keyboard slave.
+# One test starts and kills a second, private Xvfb (-displayfd).
+if ! xvfb-run -a -s "-screen 0 1280x800x24" \
+  cargo test --test abort_watch_xvfb -- --ignored --test-threads=1 ${FILTER:+"$FILTER"}; then
+  failed+=("abort_watch_xvfb")
+fi
+
+if ((${#failed[@]})); then
+  printf 'FAILED suite: %s\n' "${failed[@]}" >&2
+  exit 1
+fi
+echo "all Xvfb suites passed"

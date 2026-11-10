@@ -118,6 +118,7 @@ pub fn contract_report() -> DoctorContract {
         capabilities: DoctorCapabilities {
             screenshot_mask: true,
         },
+        abort_watch: crate::abort::doctor(),
     }
 }
 

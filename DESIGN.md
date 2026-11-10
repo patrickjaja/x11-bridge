@@ -56,6 +56,7 @@ the kwin bridge emits them and how the JS reads them).
 | `hold-key --key <k>... --duration-ms N` | `{action, keys, durationMs}` | body ignored |
 | `session-start [--foreground]` | `{ok:true, session:"noop"}` | `execBridge` tolerates any/empty output |
 | `session-end` | `{ok:true, ended:true}` | same |
+| `abort-watch` | long-running, JSON lines (see [Escape abort](#escape-abort-abort-watch)) | `js/cu_esc_watch.js` |
 
 Many action subcommands have their JSON body ignored by the JS (it only cares
 about exit code / stderr), but they still emit a structured object for parity
@@ -158,9 +159,76 @@ keyname  := <CU key-name from table> | <single literal char>
 The authoritative starting table lives in `src/input/keymap.rs`
 (`CU_KEY_NAMES`, `MODIFIER_TOKENS`).
 
+## Escape abort (`abort-watch`)
+
+The one long-running subcommand: Claude Desktop spawns `x11-bridge abort-watch`
+while Computer Use holds its lock, and the user's Escape stops the turn. The
+wire protocol, `suspend` / `resume`, signals, parent-death handling and exit
+codes come from the shared
+[`cu-abort-watch`](https://github.com/patrickjaja/cu-abort-watch) crate (its
+README is the contract); x11-bridge supplies the watcher:
+
+```
+{"event":"ready","mechanism":"xi2","syntheticSafe":true}   once armed
+{"event":"abort"}                                           per physical Escape press
+{"event":"error","message":"..."}                           arming failed (exit 2) / X connection lost (exit 1)
+```
+
+Mechanism `xi2`:
+
+- Selects `XI_RawKeyPress`, `XI_RawKeyRelease` and `XI_HierarchyChanged` on the
+  root window for `XIAllDevices`, after announcing XInput 2.2. Arming fails
+  when the XInput extension is missing or the server speaks less than 2.1
+  (from 2.1 on, raw events reach every selecting client even while another
+  client holds a grab).
+- Passive: nothing is grabbed and the key is not consumed, so the user's
+  Escape also reaches the focused window. Nothing needs undoing at exit; the
+  selection ends with the connection.
+- The model's Escape is excluded by source device. `key-sequence` and every
+  other input subcommand inject with XTEST, which the server routes through the
+  master's `... XTEST keyboard` slave; raw events carry that slave as
+  `sourceid`. Devices are classified by the server's `XTEST Device` property
+  (name suffix ` XTEST keyboard` / ` XTEST pointer` when the property cannot be
+  read) at arm and on every hierarchy change, so a new master's XTEST slaves
+  are excluded too. Any other source (hardware keyboards, a newly plugged
+  keyboard, a floating slave) is physical. Other XTEST clients (`xdotool`) are
+  excluded the same way.
+- With `XIAllDevices` every press arrives twice (slave copy, master copy);
+  both carry the physical slave as `sourceid`, which is what events are keyed
+  by, so the second copy reads as a repeat and a server sending only one copy
+  still works. On Xvfb the slave copy arrived under a passive key grab and an
+  active keyboard grab.
+- One `abort` per press, erring toward reporting (a duplicate is harmless, a
+  missed abort is not): a press flagged `KeyRepeat` never reports; a press of
+  the key a device last pressed and has not released is a repeat only while
+  that hold is under 2 s old (unflagged repeats keep it fresh). Any other key
+  press on that device and every hierarchy event clear the hold, so a lost
+  release (device disabled while held, VT switch, suspend) cannot swallow
+  later presses.
+- A device re-scan or keymap re-read that fails is retried twice (50 ms, then
+  200 ms) before the watcher fails.
+- Escape keycodes: every keycode with the Escape keysym in any column of the
+  core keyboard mapping, re-read on each keyboard `MappingNotify` (also covers
+  `caps:escape` style remaps). Per-device XKB keymaps (`setxkbmap -device`)
+  are not consulted.
+- `suspend` / `resume` keep the crate defaults (reporting muted while
+  suspended); the shared reference count is not used (XInput selections are
+  per client).
+- Xwayland: `syntheticSafe` is `false` there. Xwayland started with
+  `-enable-ei-portal` (GNOME, KDE) forwards XTEST through libei to the
+  compositor, which may send the key back on the non-XTEST
+  `xwayland-keyboard` device, where it would read as physical; the X side
+  cannot tell. Xwayland also only sees keys while an X client has focus.
+  Claude Desktop picks the watcher by host compositor, so `xi2` is the X11
+  session mechanism, not the Wayland one.
+
+`doctor` adds `"abortWatch": {"available": bool, "mechanism": "xi2",
+"reason": string|null}`: available when the X server is reachable and speaks
+XInput >= 2.1, otherwise the reason.
+
 ## Error contract
 
-- Success: one JSON value on stdout, exit 0.
+- Success: one JSON value on stdout, exit 0 (`abort-watch` excepted, see above).
 - Failure: `anyhow` error chain printed to stderr (`{error:#}`), exit 1.
 - Unknown/invalid CLI: clap message on stderr, exit 2.
 - The JS `execBridge` surfaces stderr (or stdout, or `error.message`) as the

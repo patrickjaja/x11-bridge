@@ -284,3 +284,25 @@ fn mask_flags_parse_and_conflict() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
 }
+
+#[test]
+fn doctor_reports_abort_watch_unavailable_without_display() {
+    let out = run(&["doctor"]);
+    let v: Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    let aw = &v["abortWatch"];
+    assert_eq!(aw["available"], false, "{v}");
+    assert_eq!(aw["mechanism"], "xi2");
+    assert!(aw["reason"].is_string(), "{v}");
+}
+
+#[test]
+fn abort_watch_without_display_fails_to_arm() {
+    let out = run(&["abort-watch"]);
+    assert_eq!(out.status.code(), Some(2), "arming failed -> exit 2");
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    let v: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["event"], "error");
+    assert!(v["message"].is_string());
+}
