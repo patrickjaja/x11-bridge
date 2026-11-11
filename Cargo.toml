@@ -14,7 +14,7 @@ clap = { version = "4.6.1", features = ["derive", "std", "help", "suggestions"],
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 serde = { version = "1.0.228", features = ["derive", "std"], default-features = false }
 serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
-x11rb = { version = "0.13.2", default-features = false, features = ["randr", "xtest", "xfixes", "xinput"] }
+x11rb = { version = "0.13.2", default-features = false, features = ["randr", "shape", "xtest", "xfixes", "xinput"] }
 xkeysym = "0.2.1"
 
 [profile.release]

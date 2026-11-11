@@ -127,6 +127,10 @@ pub fn contract_report() -> DoctorContract {
 
     let conn = Conn::connect();
     let (compositing, compositing_error) = compositing_field(conn.as_ref());
+    let input_shape = conn
+        .as_ref()
+        .ok()
+        .and_then(|conn| crate::wm::input_shape_supported(conn).ok());
     let probed = conn.and_then(|conn| doctor(&conn));
     let (details, backend_error) = match probed {
         Ok(report) => (Some(report), None),
@@ -154,6 +158,7 @@ pub fn contract_report() -> DoctorContract {
             screenshot_mask_ignore: true,
             compositing,
             compositing_error,
+            input_shape,
         },
         abort_watch: crate::abort::doctor(),
     }

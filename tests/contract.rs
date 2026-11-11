@@ -237,6 +237,7 @@ fn doctor_reports_screenshot_mask_capability() {
     // No X display: compositing is unknown (null) with a reason, doctor exits 0.
     assert!(v["capabilities"]["compositing"].is_null(), "{v}");
     assert!(v["capabilities"]["compositing_error"].is_string(), "{v}");
+    assert!(v["capabilities"]["input_shape"].is_null(), "{v}");
 }
 
 #[test]

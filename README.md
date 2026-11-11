@@ -13,7 +13,9 @@ how it parses output.
 **Status: experimental, v0.1.** All subcommands are implemented: connection +
 RandR monitor enumeration, `GetImage` capture (JPEG), XTEST pointer/keyboard
 synthesis, and EWMH/ICCCM window queries. The XTEST-injection paths are covered
-by Xvfb integration tests (run via `scripts/test-xvfb.sh`). The resolver is wired
+by Xvfb integration tests (run via `scripts/test-xvfb.sh`), and `app-under-point`
+by tests under a real reparenting window manager (xfwm4 on a private Xvfb; the
+script needs `xfwm4` and `dbus-daemon`). The resolver is wired
 into `claude-desktop-extra`'s `js/cu_linux_executor.js`, which bundles this binary
 and drives it on X11 and XWayland sessions.
 

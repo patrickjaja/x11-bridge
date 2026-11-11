@@ -44,7 +44,7 @@ the kwin bridge emits them and how the JS reads them).
 | `windows` | `[{id, title, geometry, pid, desktop_file_name, resource_class, resource_name, window_role, window_type, is_dock, is_desktop, is_visible, is_minimized, is_normal_window, is_dialog, transient, transient_for, output, stacking_order, is_active, exclude_from_capture, keep_above}]` (snake_case) | `normalizeBundleIdFromWindow`, `dockableWindow`, `findHostMainWindow` read `desktop_file_name`, `resource_class`, `resource_name`, `is_minimized`, `is_visible`, `is_dialog`, `is_normal_window`, `is_active`, `stacking_order`, `output`, `keep_above`, `transient`, `transient_for` |
 | `cursor-position` | `{x, y}` | `getCursorPosition` reads `result.x`/`result.y` |
 | `frontmost-app` | `{bundleId, displayName}` (camelCase), or JSON `null` when no window is active | `_appRefFromCommand` reads `result.bundleId`/`displayName` and maps anything else to no app |
-| `app-under-point --x --y` | `{bundleId, displayName}` | same as above |
+| `app-under-point --x --y` | `{bundleId, displayName}` (camelCase; `bundleId` is the client's decimal window id when it names no app), or JSON `null` when no window is at the point | same as above |
 | `activate-window --window <id>` | `{activated: <id>}` (or similar ack object) | `activateWindow` ignores the body (fire-and-forget) |
 | `pointer-move --x --y` | `{action, x, y}` (camelCase) | body ignored |
 | `pointer-click --x --y [--button] [--count] [--modifier ...]` | `{action, x, y, raised?}` | body ignored |
@@ -189,6 +189,16 @@ Why it matters: without a compositing manager X has no alpha blending, so a
 Use glow) is drawn opaque, typically black over the whole area. Consumers
 should treat `false` and `null` alike as "no compositor": do not show
 see-through overlays.
+
+## Input shapes (`doctor.capabilities.input_shape`)
+
+`doctor` reports `true` when the X server has the SHAPE extension at version
+1.1 or later (input shapes), `false` without it, `null` without an X display.
+With it, `app-under-point` skips windows whose input shape does not contain
+the point (see the hit test under Implementation notes), so a click-through
+overlay above everything does not answer for the windows below it. Without
+it, every window counts in its full rectangle. Xorg and Xvfb have had SHAPE
+1.1 since 2006.
 
 ## Key-spec grammar
 
@@ -370,20 +380,57 @@ without changing its parsing.
     `0x`-prefixed hex, so an id copied from `xwininfo`/`xprop` also works.
   - **`bundle_id` derivation** (`frontmost-app` / `app-under-point`): mirrors the
     JS `normalizeBundleIdFromWindow` - first non-empty of `desktop_file_name`,
-    `resource_class`, `resource_name`, then the numeric id, with a trailing
-    `.desktop` stripped. `display_name` is the window title, else the bundle id.
+    `resource_class`, `resource_name`, with a trailing `.desktop` stripped,
+    then the window's own decimal id (the `id` that `windows` lists for it, so
+    the executor can find that entry and resolve the app by pid, or refuse it
+    as an unattributed window). The window is always an application window -
+    the ICCCM client, or an override-redirect window itself - never a WM frame
+    or decoration window. `display_name` is the window title, else the bundle
+    id.
+  - **`app-under-point` hit test:** walks the root's children top to bottom
+    (the X stacking order, which every WM keeps for its frames). A root child
+    whose **input shape** (SHAPE `GetRectangles` of kind `Input`, relative to
+    the window origin) does not contain the point is skipped: the server
+    routes the click past it. That is how click-through overlays are looked
+    through, such as Claude's Computer Use glow (override-redirect, WM_CLASS
+    `com.anthropic.Claude`; Electron 45's `setIgnoreMouseEvents(true)` gives
+    it a 1x1 input rectangle at its origin, other toolkits an empty one). A
+    window without an input shape reports its whole rectangle. Without SHAPE
+    1.1 (`doctor.capabilities.input_shape: false`) every window counts in its
+    full rectangle. A point in a
+    managed window's frame (title bar, buttons, borders) or client area
+    resolves to the ICCCM client below that frame: the root child itself when
+    it carries `WM_STATE`, else the first window with `WM_STATE` in a
+    breadth-first descent of up to three levels (the `XmuClientWindow` route,
+    same as the mask reader); failing that, a member of `_NET_CLIENT_LIST` /
+    `_NET_CLIENT_LIST_STACKING` whose root-child ancestor is this root child
+    (a client deeper than three levels). Without a WM (nobody sets
+    `WM_STATE`) a root child with a `WM_CLASS`, else its first viewable child
+    with one, counts. A root child with none of these is a window of the WM's
+    own and is looked through.
+    A client with `_GTK_FRAME_EXTENTS` (client-side decorations) only counts
+    inside its visible part (`mask::visual_rect`): the invisible shadow margin
+    falls through to whatever is below. `_NET_WM_STATE_HIDDEN` windows are
+    looked through. Docks, the desktop window and override-redirect popups
+    answer only when no application window is at the point (the topmost of
+    them). The answer is `{bundleId, displayName}` of that client (its own id
+    when it names no app, see above), or `null` only when no window is at the
+    point (the empty desktop). The `windows`
+    geometry stays the X client rect, shadow margin included (`ax` maps
+    AT-SPI coordinates against that client rect).
   - **`exclude_from_capture` is always `false`** - X11 has no per-window
     capture-exclusion (that is a KWin compositor feature); the field exists only
     for JSON parity with the kwin bridge.
-  - **Window-list fallback order:** `windows` and `app-under-point` use
+  - **Window-list fallback order:** `windows` uses
     `_NET_CLIENT_LIST_STACKING`, else `_NET_CLIENT_LIST` (xfwm4 sets only this
     one; the WM's own order, not stacking, so frontmost relies on
     `_NET_ACTIVE_WINDOW`), else a `query_tree` of the root's children (bare X /
     Xvfb / minimal WMs), keeping mapped, non-override-redirect top-levels that
     carry a `WM_CLASS` (a root child without one is treated as a WM frame and
     searched one level down for the client).
-  - **EWMH-absent fallback:** `frontmost-app` falls back to `GetInputFocus` (focus `None`, `PointerRoot` or the root window means no app: it prints `null`);
-    `app-under-point` falls back to a `translate_coordinates` child walk. Every
+  - **EWMH-absent fallback:** `frontmost-app` falls back to `GetInputFocus` (focus `None`, `PointerRoot` or the root window means no app: it prints `null`;
+    a focused frame or client subwindow is reported as its ICCCM client).
+    `app-under-point` needs no EWMH (see its hit test above). Every
     optional property that is absent maps to `None`/`false` rather than an error,
     so read-only commands never crash on a WM-less display (they return an empty
     list or a graceful `exit 1`).

@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-11-11
+
+### Fixed
+
+- `app-under-point` on a reparenting window manager (xfwm4, Openbox, Marco,
+  ...): a point on a window's title bar, buttons or border answered with a
+  bare decoration-window id (`{"bundleId":"7710972"}`), so Claude Desktop
+  refused clicks on window controls. The hit test now walks the X stacking
+  order and resolves every root child to its ICCCM client (`WM_STATE`), so
+  the frame answers with the client's app. A title bar lying over another
+  window's client area no longer answers with that lower window.
+- The invisible shadow margin of a client-side-decorated window
+  (`_GTK_FRAME_EXTENTS`) no longer counts as the window; the point falls
+  through to what is below.
+- `app-under-point` looks through click-through windows: a root child whose
+  input shape (SHAPE) does not contain the point is skipped, as the server
+  routes the click past it. Claude's own Computer Use glow (override-redirect,
+  1x1 input rectangle) no longer answers for the dock, the desktop or the
+  windows below it. `doctor` reports `capabilities.input_shape`.
+- A client deeper than three levels below its frame is found through the WM's
+  client list instead of the point falling through to the window below.
+- A client that names no app answers with its own window id (the `id` that
+  `windows` lists), never a frame or decoration id, in `app-under-point` and
+  in the `frontmost-app` focus fallback. `app-under-point` prints `null` only
+  when no window is at the point (the empty desktop), and exits 0 there
+  instead of failing.
+
 ## 2026-11-10
 
 ### Added

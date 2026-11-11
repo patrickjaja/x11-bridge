@@ -185,6 +185,12 @@ pub struct DoctorCapabilities {
     pub compositing: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compositing_error: Option<String>,
+    /// Whether the X server reports input shapes (SHAPE >= 1.1), so
+    /// `app-under-point` looks through click-through windows (an empty or
+    /// tiny input shape, e.g. Electron's `setIgnoreMouseEvents(true)`). When
+    /// false, every window counts in its full rectangle. `null` = unknown (no
+    /// X display).
+    pub input_shape: Option<bool>,
 }
 
 /// X server details reported by `doctor` when reachable (bridge-specific extras).

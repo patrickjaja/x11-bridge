@@ -12,10 +12,11 @@
 //! property that is absent maps to `None` rather than an error.
 
 use anyhow::{Context, Result, anyhow};
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::shape::{self, ConnectionExt as ShapeConnectionExt};
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ConnectionExt as XprotoConnectionExt, EventMask, MapState,
-    StackMode, Window,
+    Rectangle, StackMode, Window, WindowClass,
 };
 
 use crate::conn::Conn;
@@ -54,6 +55,8 @@ struct Atoms {
     type_popup_menu: u32,
     type_dropdown_menu: u32,
     net_client_list: u32,
+    wm_state: u32,
+    gtk_frame_extents: u32,
 }
 
 impl Atoms {
@@ -87,6 +90,8 @@ impl Atoms {
             "_NET_WM_WINDOW_TYPE_POPUP_MENU",
             "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
             "_NET_CLIENT_LIST",
+            "WM_STATE",
+            "_GTK_FRAME_EXTENTS",
         ];
 
         // Fire all intern_atom requests, then collect replies: still bounded
@@ -128,6 +133,8 @@ impl Atoms {
             type_popup_menu: atoms[23],
             type_dropdown_menu: atoms[24],
             net_client_list: atoms[25],
+            wm_state: atoms[26],
+            gtk_frame_extents: atoms[27],
         })
     }
 
@@ -312,46 +319,52 @@ impl WindowProps {
         }
     }
 
-    /// Best-effort bundle id derivation, mirroring the JS
-    /// `normalizeBundleIdFromWindow` candidate order (`desktop_file_name`,
-    /// `resource_class`, `resource_name`, `id`) with the trailing `.desktop`
-    /// stripped. Used to build an `AppRef` for frontmost/under-point.
+    /// Bundle id derivation, mirroring the JS `normalizeBundleIdFromWindow`
+    /// candidate order (`desktop_file_name`, `resource_class`,
+    /// `resource_name`, `id`) with the trailing `.desktop` stripped. Used to
+    /// build an `AppRef` for frontmost/under-point.
+    ///
+    /// A window that names no app answers with its own id (decimal, the form
+    /// `windows` prints), so the executor can still find it in the `windows`
+    /// list and resolve it by pid, or refuse it as an unattributed window.
+    /// Callers only ever pass an application window here (the ICCCM client,
+    /// or an override-redirect window), never a WM frame or decoration window.
     fn bundle_id(&self) -> String {
-        for value in [
+        bundle_id_from(
             self.desktop_file_name.as_deref(),
             self.resource_class.as_deref(),
             self.resource_name.as_deref(),
-        ]
+        )
+        .unwrap_or_else(|| self.id.to_string())
+    }
+
+    /// `{bundleId, displayName}` for this window. The display name mirrors the
+    /// JS `displayNameFromWindow`: the window title, else the bundle id.
+    fn to_app_ref(&self) -> AppRef {
+        let bundle_id = self.bundle_id();
+        let display_name = match self.title.as_deref() {
+            Some(title) if !title.trim().is_empty() => title.to_owned(),
+            _ => bundle_id.clone(),
+        };
+        AppRef {
+            bundle_id,
+            display_name,
+        }
+    }
+}
+
+/// First non-empty of the window's own app ids, `.desktop` stripped.
+fn bundle_id_from(
+    desktop_file_name: Option<&str>,
+    resource_class: Option<&str>,
+    resource_name: Option<&str>,
+) -> Option<String> {
+    [desktop_file_name, resource_class, resource_name]
         .into_iter()
         .flatten()
-        {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return strip_desktop_suffix(trimmed).to_owned();
-            }
-        }
-        // Last resort: the numeric window id as a string (matches the JS, which
-        // falls through to `window.id`).
-        self.id.to_string()
-    }
-
-    /// Display name for an `AppRef`, mirroring the JS `displayNameFromWindow`:
-    /// prefer the window title, else the bundle id.
-    fn display_name(&self) -> String {
-        if let Some(title) = self.title.as_deref()
-            && !title.trim().is_empty()
-        {
-            return title.to_owned();
-        }
-        self.bundle_id()
-    }
-
-    fn to_app_ref(&self) -> AppRef {
-        AppRef {
-            bundle_id: self.bundle_id(),
-            display_name: self.display_name(),
-        }
-    }
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(|value| strip_desktop_suffix(value).to_owned())
 }
 
 /// Whether a `_NET_WM_WINDOW_TYPE` list contains any type that makes a window
@@ -663,8 +676,16 @@ pub fn frontmost_app(conn: &Conn) -> Result<Option<AppRef>> {
                 .reply()
                 .context("failed to read input focus reply")?
                 .focus;
-            match focus_to_window(focus, conn.root) {
-                Some(window) => window,
+            let Some(focus) = focus_to_window(focus, conn.root) else {
+                return Ok(None);
+            };
+            // The focus can sit on a frame or on a subwindow of a client;
+            // report the client it belongs to (never a frame's own id).
+            let clients = managed_clients(conn, &atoms);
+            match top_level_of(conn, focus)
+                .and_then(|top| resolve_client(conn, &atoms, top, &clients))
+            {
+                Some(client) => client,
                 None => return Ok(None),
             }
         }
@@ -674,53 +695,355 @@ pub fn frontmost_app(conn: &Conn) -> Result<Option<AppRef>> {
     Ok(Some(props.to_app_ref()))
 }
 
-/// Report the topmost app whose frame contains the global point `(x, y)`.
-pub fn app_under_point(conn: &Conn, x: i32, y: i32) -> Result<AppRef> {
-    let atoms = Atoms::intern(conn)?;
-    let stacking = client_list_stacking(conn, &atoms)?;
-
-    // Walk top-to-bottom (stacking is bottom-to-top) and pick the first mapped,
-    // non-dock/desktop window whose root-relative frame contains the point.
-    for &window in stacking.iter().rev() {
-        let props = WindowProps::read(conn, &atoms, window);
-        if !props.map_state_viewable || props.is_hidden {
-            continue;
-        }
-        if props.is_dock || props.is_desktop {
-            continue;
-        }
-        if rect_contains(&props.geometry, x, y) {
-            return Ok(props.to_app_ref());
+/// Every window in `_NET_CLIENT_LIST_STACKING` and `_NET_CLIENT_LIST` (empty
+/// without an EWMH window manager).
+fn managed_clients(conn: &Conn, atoms: &Atoms) -> Vec<Window> {
+    let mut clients = get_prop_u32(conn, conn.root, atoms.net_client_list_stacking);
+    for client in get_prop_u32(conn, conn.root, atoms.net_client_list) {
+        if !clients.contains(&client) {
+            clients.push(client);
         }
     }
+    clients
+}
 
-    // Fallback for a missing client list: translate the point down the tree
-    // from the root to the deepest child under it, then read that window.
-    let mut current = conn.root;
-    loop {
-        let reply = conn
-            .conn
-            .translate_coordinates(
-                conn.root,
-                current,
-                i16::try_from(x).unwrap_or(0),
-                i16::try_from(y).unwrap_or(0),
-            )
-            .context("failed to translate coordinates during hit-test")?
-            .reply()
-            .context("failed to read coordinate translation")?;
-        let child = reply.child;
-        if child == 0 || child == x11rb::NONE {
+/// The first managed client (from the WM's client list) whose root-child
+/// ancestor is `top`: finds a client that sits deeper below its frame than
+/// the `WM_STATE` search reaches.
+fn client_in_frame(
+    top: Window,
+    clients: &[Window],
+    mut top_level: impl FnMut(Window) -> Option<Window>,
+) -> Option<Window> {
+    clients
+        .iter()
+        .copied()
+        .find(|&client| client != 0 && top_level(client) == Some(top))
+}
+
+/// Whether the server's SHAPE extension can report input shapes (version
+/// 1.1 or later), which the hit test uses to look through click-through
+/// windows.
+pub fn input_shape_supported(conn: &Conn) -> Result<bool> {
+    let present = conn
+        .conn
+        .extension_information(shape::X11_EXTENSION_NAME)
+        .context("failed to query the SHAPE extension")?
+        .is_some();
+    if !present {
+        return Ok(false);
+    }
+    let version = conn
+        .conn
+        .shape_query_version()
+        .context("failed to request the SHAPE version")?
+        .reply()
+        .context("failed to read the SHAPE version")?;
+    Ok(version.major_version > 1 || (version.major_version == 1 && version.minor_version >= 1))
+}
+
+/// Whether the point `(x, y)` lies in a region given as rectangles relative
+/// to `(origin_x, origin_y)`. An empty list is an empty region.
+fn region_contains(rects: &[Rectangle], origin_x: i32, origin_y: i32, x: i32, y: i32) -> bool {
+    rects.iter().any(|r| {
+        rect_contains(
+            &Rect {
+                x: origin_x + i32::from(r.x),
+                y: origin_y + i32::from(r.y),
+                width: i32::from(r.width),
+                height: i32::from(r.height),
+            },
+            x,
+            y,
+        )
+    })
+}
+
+/// Whether root child `top` takes a click at `(x, y)`: its input shape (the
+/// region the server routes pointer events by) contains the point. A window
+/// without an input shape reports its whole rectangle, so it counts in full;
+/// a click-through window (an empty input shape, or a 1x1 one) does not. When
+/// the shape cannot be read the window counts (the outer-rectangle rule).
+fn takes_input_at(conn: &Conn, top: Window, origin_x: i32, origin_y: i32, x: i32, y: i32) -> bool {
+    match conn
+        .conn
+        .shape_get_rectangles(top, shape::SK::INPUT)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    {
+        Some(reply) => region_contains(&reply.rectangles, origin_x, origin_y, x, y),
+        None => true,
+    }
+}
+
+/// How deep below a root child the ICCCM client is searched for. Reparenting
+/// WMs put it one level down (xfwm4, Openbox, Marco, Metacity, Mutter X11) or
+/// two (KWin X11, Fluxbox); three leaves a margin, like the mask reader.
+const CLIENT_SEARCH_DEPTH: usize = 3;
+
+/// The ICCCM client below a root child (the `XmuClientWindow` route): `top`
+/// itself when it carries `WM_STATE`, else the first window that does in a
+/// breadth-first descent of at most [`CLIENT_SEARCH_DEPTH`] levels. The window
+/// manager sets `WM_STATE` on every client it manages and never on its own
+/// frame or decoration windows, so this finds the application window behind a
+/// title bar or border without guessing from geometry.
+fn find_client_with(
+    top: Window,
+    mut has_wm_state: impl FnMut(Window) -> bool,
+    mut children: impl FnMut(Window) -> Vec<Window>,
+) -> Option<Window> {
+    if has_wm_state(top) {
+        return Some(top);
+    }
+    let mut level = vec![top];
+    for _ in 0..CLIENT_SEARCH_DEPTH {
+        let mut next = Vec::new();
+        for window in level {
+            for child in children(window) {
+                if has_wm_state(child) {
+                    return Some(child);
+                }
+                next.push(child);
+            }
+        }
+        if next.is_empty() {
             break;
         }
-        current = child;
+        level = next;
+    }
+    None
+}
+
+fn has_wm_state(conn: &Conn, atoms: &Atoms, window: Window) -> bool {
+    conn.conn
+        .get_property(false, window, atoms.wm_state, AtomEnum::ANY, 0, 0)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|reply| reply.type_ != u32::from(AtomEnum::NONE))
+}
+
+/// A window's children, bottom to top; empty when it cannot be read (gone).
+fn children_of(conn: &Conn, window: Window) -> Vec<Window> {
+    conn.conn
+        .query_tree(window)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|tree| tree.children)
+        .unwrap_or_default()
+}
+
+/// The application window behind root child `top`: the ICCCM client (see
+/// [`find_client_with`]); else a member of the WM's client list (`clients`)
+/// that sits below `top` deeper than that search reaches. Without a window
+/// manager nobody sets `WM_STATE` (bare X, Xvfb); there `top` itself counts
+/// when it carries a `WM_CLASS`, else its first viewable child that does (the
+/// same heuristic as the `windows` tree fallback). `None` = a window of the
+/// WM's own (no client below it).
+fn resolve_client(conn: &Conn, atoms: &Atoms, top: Window, clients: &[Window]) -> Option<Window> {
+    if let Some(client) = find_client_with(
+        top,
+        |window| has_wm_state(conn, atoms, window),
+        |window| children_of(conn, window),
+    ) {
+        return Some(client);
+    }
+    if let Some(client) = client_in_frame(top, clients, |client| top_level_of(conn, client)) {
+        return Some(client);
+    }
+    let has_class = |window: Window| {
+        let (instance, class) = get_wm_class(conn, window);
+        instance.is_some() || class.is_some()
+    };
+    if has_class(top) {
+        return Some(top);
+    }
+    children_of(conn, top)
+        .into_iter()
+        .rev()
+        .find(|&child| is_viewable_managed(conn, child) && has_class(child))
+}
+
+/// The root child that holds `window` (`window` itself when it is one).
+fn top_level_of(conn: &Conn, window: Window) -> Option<Window> {
+    let mut current = window;
+    // Bounded: a window tree is never deeper than this in practice.
+    for _ in 0..64 {
+        let tree = conn.conn.query_tree(current).ok()?.reply().ok()?;
+        if tree.parent == conn.root || tree.parent == x11rb::NONE {
+            return Some(current);
+        }
+        current = tree.parent;
+    }
+    None
+}
+
+/// What one root child at the point means for the hit test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    /// An application window (its frame, decorations or client area): the
+    /// answer.
+    App,
+    /// A dock, the desktop or an override-redirect popup: the answer only when
+    /// no application window is at the point.
+    Fallback,
+    /// Not a target here: hidden, no client, or a point in the invisible
+    /// shadow margin of a client-side-decorated window. Look below.
+    Skip,
+}
+
+/// Pick the answer from the root children at the point, top to bottom: the
+/// first [`Hit::App`]; else the topmost [`Hit::Fallback`]; else nothing.
+fn pick_hit<T>(layers: impl IntoIterator<Item = (T, Hit)>) -> Option<T> {
+    let mut fallback = None;
+    for (window, hit) in layers {
+        match hit {
+            Hit::App => return Some(window),
+            Hit::Fallback => {
+                if fallback.is_none() {
+                    fallback = Some(window);
+                }
+            }
+            Hit::Skip => {}
+        }
+    }
+    fallback
+}
+
+/// The part of a root child that shows the window: its outer rect, or for a
+/// client with `_GTK_FRAME_EXTENTS` (client-side decorations) the client rect
+/// minus those invisible shadow margins. Same rule as the mask reader
+/// ([`crate::mask::visual_rect`]), so a hit and a kept region agree.
+fn visible_rect(outer: &Rect, client: &Rect, gtk_extents: &[u32]) -> Rect {
+    let px = |r: &Rect| crate::mask::PxRect::new(r.x, r.y, r.width, r.height);
+    let extents = (gtk_extents.len() >= 4).then(|| {
+        [
+            gtk_extents[0],
+            gtk_extents[1],
+            gtk_extents[2],
+            gtk_extents[3],
+        ]
+    });
+    let visible = crate::mask::visual_rect(px(outer), extents.map(|_| px(client)), extents);
+    Rect {
+        x: visible.x,
+        y: visible.y,
+        width: visible.width,
+        height: visible.height,
+    }
+}
+
+/// Classify root child `top` (known to cover the point with its outer rect)
+/// and return the window whose app it stands for.
+#[allow(clippy::too_many_arguments)]
+fn classify_hit(
+    conn: &Conn,
+    atoms: &Atoms,
+    clients: &[Window],
+    top: Window,
+    override_redirect: bool,
+    outer: &Rect,
+    x: i32,
+    y: i32,
+) -> (Window, Hit) {
+    if override_redirect {
+        return (top, Hit::Fallback);
+    }
+    let Some(client) = resolve_client(conn, atoms, top, clients) else {
+        return (top, Hit::Skip);
+    };
+    let props = WindowProps::read(conn, atoms, client);
+    if props.is_hidden {
+        return (client, Hit::Skip);
+    }
+    let extents = get_prop_u32(conn, client, atoms.gtk_frame_extents);
+    if !rect_contains(&visible_rect(outer, &props.geometry, &extents), x, y) {
+        return (client, Hit::Skip);
+    }
+    if props.is_dock || props.is_desktop {
+        (client, Hit::Fallback)
+    } else {
+        (client, Hit::App)
+    }
+}
+
+/// Report the app of the topmost window at the global point `(x, y)`, or
+/// `None` (JSON `null`, the no-app answer) when no window is there (the empty
+/// desktop).
+///
+/// Walks the root's children top to bottom (the X stacking order, which every
+/// window manager keeps for its frames), skipping the ones whose input shape
+/// does not contain the point (click-through overlays: the click goes past
+/// them). A point anywhere in a managed window's frame - title bar, buttons,
+/// borders - or in its client area resolves to the client below that frame.
+/// Docks, the desktop window and override-redirect popups only answer when no
+/// application window is at the point; the invisible shadow margin of a
+/// client-side-decorated window is not the window.
+pub fn app_under_point(conn: &Conn, x: i32, y: i32) -> Result<Option<AppRef>> {
+    let atoms = Atoms::intern(conn)?;
+    let tree = conn
+        .conn
+        .query_tree(conn.root)
+        .context("failed to query the window tree")?
+        .reply()
+        .context("failed to read the window tree reply")?;
+    // Without SHAPE input shapes, every window counts in its full rectangle.
+    let input_shapes = input_shape_supported(conn).unwrap_or(false);
+    let clients = managed_clients(conn, &atoms);
+
+    let mut layers = Vec::new();
+    for &top in tree.children.iter().rev() {
+        let Some(attrs) = conn
+            .conn
+            .get_window_attributes(top)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        else {
+            continue;
+        };
+        if attrs.map_state != MapState::VIEWABLE || attrs.class == WindowClass::INPUT_ONLY {
+            continue;
+        }
+        let Some(geometry) = conn
+            .conn
+            .get_geometry(top)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        else {
+            continue;
+        };
+        let border = i32::from(geometry.border_width);
+        let outer = Rect {
+            x: i32::from(geometry.x),
+            y: i32::from(geometry.y),
+            width: i32::from(geometry.width) + 2 * border,
+            height: i32::from(geometry.height) + 2 * border,
+        };
+        if !rect_contains(&outer, x, y) {
+            continue;
+        }
+        // Shape rectangles are relative to the window origin (inside the
+        // border).
+        if input_shapes && !takes_input_at(conn, top, outer.x + border, outer.y + border, x, y) {
+            continue;
+        }
+        let layer = classify_hit(
+            conn,
+            &atoms,
+            &clients,
+            top,
+            attrs.override_redirect,
+            &outer,
+            x,
+            y,
+        );
+        let done = layer.1 == Hit::App;
+        layers.push(layer);
+        if done {
+            break;
+        }
     }
 
-    if current == conn.root {
-        return Err(anyhow!("no window under point ({x}, {y})"));
-    }
-    let props = WindowProps::read(conn, &atoms, current);
-    Ok(props.to_app_ref())
+    Ok(pick_hit(layers).map(|window| WindowProps::read(conn, &atoms, window).to_app_ref()))
 }
 
 /// Parse a window id string accepted by `activate-window`. Accepts both decimal
@@ -858,6 +1181,197 @@ mod tests {
             height: 0,
         };
         assert!(!rect_contains(&empty, 0, 0));
+    }
+
+    /// A window tree for `find_client_with`: (window, children, has WM_STATE).
+    fn search(tree: &[(Window, &[Window], bool)], top: Window) -> Option<Window> {
+        let node = |w: Window| tree.iter().find(|(id, _, _)| *id == w);
+        find_client_with(
+            top,
+            |w| node(w).is_some_and(|(_, _, state)| *state),
+            |w| {
+                node(w)
+                    .map(|(_, kids, _)| kids.to_vec())
+                    .unwrap_or_default()
+            },
+        )
+    }
+
+    #[test]
+    fn client_is_the_top_level_itself_when_it_carries_wm_state() {
+        // Non-reparenting WM (or a client mapped straight on the root).
+        assert_eq!(search(&[(10, &[11], true), (11, &[], true)], 10), Some(10));
+    }
+
+    #[test]
+    fn client_is_found_below_an_xfwm4_style_frame() {
+        // xfwm4: the frame holds a dozen decoration windows (title, buttons,
+        // borders, corners) and the client, all one level down. Only the
+        // client carries WM_STATE.
+        let tree: &[(Window, &[Window], bool)] = &[
+            (100, &[101, 102, 103, 104, 50], false),
+            (101, &[], false),
+            (102, &[], false),
+            (103, &[], false),
+            (104, &[], false),
+            (50, &[51], true),
+            (51, &[], false),
+        ];
+        assert_eq!(search(tree, 100), Some(50));
+    }
+
+    #[test]
+    fn client_is_found_two_levels_down() {
+        // KWin X11 / Fluxbox style: frame -> wrapper -> client.
+        let tree: &[(Window, &[Window], bool)] = &[
+            (100, &[101, 102], false),
+            (101, &[], false),
+            (102, &[60], false),
+            (60, &[], true),
+        ];
+        assert_eq!(search(tree, 100), Some(60));
+    }
+
+    #[test]
+    fn no_client_without_wm_state_or_beyond_the_search_depth() {
+        let flat: &[(Window, &[Window], bool)] = &[(100, &[101], false), (101, &[], false)];
+        assert_eq!(search(flat, 100), None);
+        // WM_STATE four levels down is out of reach.
+        let deep: &[(Window, &[Window], bool)] = &[
+            (100, &[1], false),
+            (1, &[2], false),
+            (2, &[3], false),
+            (3, &[4], false),
+            (4, &[], true),
+        ];
+        assert_eq!(search(deep, 100), None);
+    }
+
+    #[test]
+    fn pick_hit_prefers_the_topmost_app() {
+        assert_eq!(pick_hit([(1, Hit::App), (2, Hit::App)]), Some(1));
+        // A dock or popup above an app window does not win over it.
+        assert_eq!(pick_hit([(1, Hit::Fallback), (2, Hit::App)]), Some(2));
+        // A shadow margin / hidden window is looked through.
+        assert_eq!(pick_hit([(1, Hit::Skip), (2, Hit::App)]), Some(2));
+    }
+
+    #[test]
+    fn pick_hit_falls_back_to_the_topmost_dock_or_popup() {
+        assert_eq!(
+            pick_hit([(1, Hit::Skip), (2, Hit::Fallback), (3, Hit::Fallback)]),
+            Some(2)
+        );
+        assert_eq!(pick_hit([(1, Hit::Skip)]), None);
+        assert_eq!(pick_hit(Vec::<(u32, Hit)>::new()), None);
+    }
+
+    fn rect(x: i32, y: i32, width: i32, height: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn visible_rect_drops_the_csd_shadow_margin() {
+        // An undecorated frame the size of the client, 20 px shadow all round.
+        let outer = rect(100, 100, 300, 200);
+        let visible = visible_rect(&outer, &outer, &[20, 20, 20, 20]);
+        assert_eq!(
+            (visible.x, visible.y, visible.width, visible.height),
+            (120, 120, 260, 160)
+        );
+        assert!(!rect_contains(&visible, 105, 200)); // left shadow
+        assert!(!rect_contains(&visible, 250, 395)); // bottom shadow
+        assert!(rect_contains(&visible, 121, 121)); // visible corner
+    }
+
+    #[test]
+    fn visible_rect_is_the_outer_rect_without_gtk_extents() {
+        // A decorated frame: the title bar and borders are outside the client
+        // but inside the outer rect, so they count.
+        let outer = rect(200, 150, 410, 334);
+        let client = rect(205, 179, 400, 300);
+        let visible = visible_rect(&outer, &client, &[]);
+        assert_eq!(
+            (visible.x, visible.y, visible.width, visible.height),
+            (200, 150, 410, 334)
+        );
+        assert!(rect_contains(&visible, 405, 164)); // title bar
+        assert!(rect_contains(&visible, 202, 329)); // left border
+        // Malformed (short) extents are ignored too.
+        let short = visible_rect(&outer, &client, &[1, 2]);
+        assert_eq!(short.width, 410);
+    }
+
+    fn r(x: i16, y: i16, width: u16, height: u16) -> Rectangle {
+        Rectangle {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn input_region_empty_and_1x1_take_no_click_elsewhere() {
+        // Electron's setIgnoreMouseEvents(true): an empty input shape, or a
+        // 1x1 one at the origin. Window origin at (100, 50).
+        assert!(!region_contains(&[], 100, 50, 640, 400));
+        assert!(!region_contains(&[r(0, 0, 1, 1)], 100, 50, 640, 400));
+        assert!(region_contains(&[r(0, 0, 1, 1)], 100, 50, 100, 50));
+        assert!(!region_contains(&[r(0, 0, 1, 1)], 100, 50, 101, 50));
+    }
+
+    #[test]
+    fn input_region_default_is_the_whole_window() {
+        // No input shape set: the server reports the window's own rectangle
+        // (border included, so it can start at a negative offset).
+        let full = [r(-2, -2, 404, 304)];
+        assert!(region_contains(&full, 100, 50, 98, 48));
+        assert!(region_contains(&full, 100, 50, 501, 351));
+        assert!(!region_contains(&full, 100, 50, 502, 351));
+        // Several rectangles: a hole between them takes no click.
+        let split = [r(0, 0, 10, 10), r(20, 0, 10, 10)];
+        assert!(region_contains(&split, 0, 0, 25, 5));
+        assert!(!region_contains(&split, 0, 0, 15, 5));
+    }
+
+    #[test]
+    fn client_in_frame_picks_the_listed_client_below_this_root_child() {
+        // Clients 7 and 9 live under root child 100, client 8 under 200.
+        let top = |c: Window| match c {
+            7 | 9 => Some(100),
+            8 => Some(200),
+            _ => None,
+        };
+        assert_eq!(client_in_frame(100, &[8, 7, 9], top), Some(7));
+        assert_eq!(client_in_frame(200, &[8, 7, 9], top), Some(8));
+        // A WM-internal root child (nothing listed under it).
+        assert_eq!(client_in_frame(300, &[8, 7, 9], top), None);
+        assert_eq!(client_in_frame(100, &[], top), None);
+        assert_eq!(client_in_frame(100, &[0], |_| Some(100)), None);
+    }
+
+    #[test]
+    fn bundle_id_from_takes_the_first_app_id() {
+        assert_eq!(
+            bundle_id_from(Some("org.kde.dolphin.desktop"), Some("dolphin"), None).as_deref(),
+            Some("org.kde.dolphin")
+        );
+        assert_eq!(
+            bundle_id_from(None, Some(" "), Some("frametest")).as_deref(),
+            Some("frametest")
+        );
+        assert_eq!(
+            bundle_id_from(None, Some("com.anthropic.Claude"), Some("claude")).as_deref(),
+            Some("com.anthropic.Claude")
+        );
+        assert_eq!(bundle_id_from(None, None, None), None);
+        assert_eq!(bundle_id_from(Some(""), Some("  "), None), None);
     }
 
     #[test]

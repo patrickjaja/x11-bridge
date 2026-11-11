@@ -41,6 +41,17 @@ if ! xvfb-run -a -s "-screen 0 1280x800x24" \
   failed+=("abort_watch_xvfb")
 fi
 
+# `app-under-point` under a reparenting window manager: every test starts its
+# own private Xvfb (-displayfd) plus an xfwm4 on its own dbus-daemon and an
+# empty XDG_CONFIG_HOME, so the desktop session is never touched. Needs xfwm4
+# (with xfconf) and dbus-daemon; missing ones fail the suite, not skip it.
+if ! command -v xfwm4 >/dev/null 2>&1 || ! command -v dbus-daemon >/dev/null 2>&1; then
+  echo "error: wm_hit_xvfb needs xfwm4 and dbus-daemon (install xfwm4, xfconf, dbus)" >&2
+  failed+=("wm_hit_xvfb (xfwm4 or dbus-daemon missing)")
+elif ! env -u DISPLAY -u WAYLAND_DISPLAY cargo test --test wm_hit_xvfb -- --ignored --test-threads=1 ${FILTER:+"$FILTER"}; then
+  failed+=("wm_hit_xvfb")
+fi
+
 if ((${#failed[@]})); then
   printf 'FAILED suite: %s\n' "${failed[@]}" >&2
   exit 1
