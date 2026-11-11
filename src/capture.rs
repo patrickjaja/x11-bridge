@@ -120,26 +120,46 @@ pub(crate) fn capture_with_mask(
         return Ok((capture_rect(conn, rect)?, None));
     };
     let atoms = MaskAtoms::intern(conn)?;
-    let (mut rgb, layers, direct_of) = {
+    let (mut rgb, layers, direct_of, ignore_of) = {
         let _grab = ServerGrab::new(conn)?;
         let layers = mask::read_layers(conn, &atoms)?;
         let direct_of = mask::resolve_requested(conn, &layers, request)?;
+        let ignore_of = mask::resolve_ignored(conn, &layers, request)?;
         let rgb = capture_rect(conn, rect)?;
-        (rgb, layers, direct_of)
+        (rgb, layers, direct_of, ignore_of)
     };
     let mut direct = vec![false; layers.len()];
     for &index in direct_of.iter().flatten() {
         direct[index] = true;
     }
     let kept = mask::decide_kept(&layers, &direct);
+    // The process that started this bridge: only its own override-redirect
+    // windows may be ignored (see mask.rs).
+    let caller_pid = caller_pid();
+    let (ignored, ignore_outcomes) = mask::decide_ignored(&layers, &kept, &ignore_of, caller_pid);
     let coverage = Coverage::build(
         PxRect::new(rect.x, rect.y, rect.width, rect.height),
         &layers,
+        &ignored,
     )?;
     coverage.apply(&kept, &mut rgb.pixels)?;
     let visible = coverage.visible(layers.len());
-    let report = mask::build_report(request, &layers, &direct_of, &kept, &visible);
+    let report = mask::build_report(
+        request,
+        &layers,
+        &direct_of,
+        &kept,
+        &visible,
+        (&ignore_outcomes, caller_pid),
+    );
     Ok((rgb, Some(report)))
+}
+
+/// Parent pid of this process: the app that spawned the bridge (Claude's main
+/// process execs it directly). Not overridable: an env var or flag would let a
+/// caller bug name another process.
+fn caller_pid() -> Option<u32> {
+    Some(std::os::unix::process::parent_id())
 }
 
 /// A rectangle in X11 root pixels, already validated non-empty.

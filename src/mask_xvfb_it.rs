@@ -187,7 +187,7 @@ fn mask_keeps_only_allowlisted_windows() {
     );
     settle(&conn);
 
-    let (img, report) = capture(&conn, &MaskRequest::Keep(vec![a, c]));
+    let (img, report) = capture(&conn, &MaskRequest::keep(vec![a, c]));
     assert_eq!(px(&img, 150, 150), rgb(RED), "kept A visible");
     assert_eq!(px(&img, 350, 200), MASK_FILL, "B over A is masked");
     assert_eq!(px(&img, 550, 300), MASK_FILL, "B masked");
@@ -222,7 +222,7 @@ fn mask_all_masks_every_pixel() {
         },
     );
     settle(&conn);
-    let (img, report) = capture(&conn, &MaskRequest::All);
+    let (img, report) = capture(&conn, &MaskRequest::all());
     assert!(img.pixels.chunks(3).all(|p| p == MASK_FILL));
     assert_eq!(report.mode, "all");
     assert!(report.kept.is_empty());
@@ -290,7 +290,7 @@ fn override_redirect_popups_follow_their_owner() {
     );
     settle(&conn);
 
-    let (img, report) = capture(&conn, &MaskRequest::Keep(vec![a]));
+    let (img, report) = capture(&conn, &MaskRequest::keep(vec![a]));
     assert_eq!(px(&img, 200, 200), rgb(RED));
     assert_eq!(px(&img, 440, 140), rgb(YELLOW), "A's menu kept outside A");
     assert_eq!(px(&img, 150, 460), rgb(CYAN), "A's tooltip kept");
@@ -346,7 +346,7 @@ fn reparented_frame_is_kept_whole_and_occluded_by_masked_frame() {
     );
     settle(&conn);
 
-    let (img, report) = capture(&conn, &MaskRequest::Keep(vec![client]));
+    let (img, report) = capture(&conn, &MaskRequest::keep(vec![client]));
     assert_eq!(px(&img, 110, 110), rgb(GRAY), "own decoration kept");
     assert_eq!(px(&img, 200, 200), rgb(RED), "client kept");
     assert_eq!(px(&img, 450, 350), MASK_FILL, "other frame on top masked");
@@ -376,7 +376,7 @@ fn missing_and_unmapped_ids_are_reported_and_masked() {
     conn.conn.unmap_window(hidden).unwrap();
     settle(&conn);
     let bogus: Window = 0x07ff_fff0;
-    let (img, report) = capture(&conn, &MaskRequest::Keep(vec![bogus, hidden]));
+    let (img, report) = capture(&conn, &MaskRequest::keep(vec![bogus, hidden]));
     assert!(img.pixels.chunks(3).all(|p| p == MASK_FILL));
     assert_eq!(
         report.kept_missing,
@@ -405,7 +405,7 @@ fn zoom_region_masks_relative_to_the_region() {
         width: 100,
         height: 100,
     };
-    let (img, report) = capture_with_mask(&conn, rect, Some(&MaskRequest::Keep(vec![a]))).unwrap();
+    let (img, report) = capture_with_mask(&conn, rect, Some(&MaskRequest::keep(vec![a]))).unwrap();
     assert_eq!((img.width, img.height), (100, 100));
     assert_eq!(px(&img, 75, 75), rgb(RED));
     assert_eq!(px(&img, 25, 25), MASK_FILL);
@@ -417,7 +417,7 @@ fn zoom_region_masks_relative_to_the_region() {
         &conn,
         Some(&monitor.name),
         (550 - monitor.x, 350 - monitor.y, 100, 100),
-        Some(&MaskRequest::Keep(vec![a])),
+        Some(&MaskRequest::keep(vec![a])),
     )
     .unwrap();
     let json = serde_json::to_value(&out).unwrap();
@@ -426,4 +426,216 @@ fn zoom_region_masks_relative_to_the_region() {
     // Unmasked zoom keeps the old shape (no `mask` key).
     let plain = crate::capture::zoom(&conn, None, (0, 0, 10, 10), None).unwrap();
     assert!(serde_json::to_value(&plain).unwrap().get("mask").is_none());
+}
+
+/// The caller's see-through overlay: a full-screen override-redirect window of
+/// the process that runs the capture code. In these in-crate tests the capture
+/// runs in the test process, so "the bridge's parent" is the test's parent.
+fn caller_overlay(conn: &Conn, pid: u32) -> Window {
+    let screen = &conn.conn.setup().roots[conn.screen_num];
+    make(
+        conn,
+        Spec {
+            rect: (0, 0, screen.width_in_pixels, screen.height_in_pixels),
+            color: YELLOW,
+            override_redirect: true,
+            class: Some("Claude"),
+            pid: Some(pid),
+            ..Spec::default()
+        },
+    )
+}
+
+fn caller_pid() -> u32 {
+    std::os::unix::process::parent_id()
+}
+
+#[test]
+#[ignore = "requires a live X server; run under scripts/test-xvfb.sh"]
+fn ignored_overlay_uncovers_kept_window_only() {
+    let conn = Conn::connect().expect("connect to Xvfb");
+    let a = make(
+        &conn,
+        Spec {
+            rect: (100, 100, 300, 200),
+            color: RED,
+            class: Some("AppA"),
+            pid: Some(7001),
+            ..Spec::default()
+        },
+    );
+    let _b = make(
+        &conn,
+        Spec {
+            rect: (600, 100, 300, 200),
+            color: BLUE,
+            class: Some("AppB"),
+            pid: Some(7002),
+            ..Spec::default()
+        },
+    );
+    // A real overlay is transparent; this one is opaque yellow, so a pixel of
+    // it in a kept region proves the image keeps the overlay's own pixels (what
+    // GetImage returns), never the window below them.
+    let glow = caller_overlay(&conn, caller_pid());
+    settle(&conn);
+
+    // Before: the overlay owns every pixel, the kept window is hidden.
+    let (img, report) = capture(&conn, &MaskRequest::keep(vec![a]));
+    assert!(img.pixels.chunks(3).all(|p| p == MASK_FILL));
+    assert_eq!(report.kept_hidden, vec![a.to_string()]);
+    assert!(report.masked.iter().any(|w| w.id == glow.to_string()));
+    assert!(report.ignored.is_empty());
+
+    // With the overlay ignored: A's region is kept (overlay pixels, as the
+    // screen shows them), B and the root are still masked.
+    let (img, report) = capture(&conn, &MaskRequest::keep(vec![a]).ignoring(vec![glow]));
+    assert_eq!(
+        px(&img, 150, 150),
+        rgb(YELLOW),
+        "kept region shows the screen"
+    );
+    assert_eq!(px(&img, 700, 150), MASK_FILL, "B under the overlay masked");
+    assert_eq!(px(&img, 10, 10), MASK_FILL, "root under the overlay masked");
+    assert_eq!(report.kept, vec![a.to_string()]);
+    assert!(report.kept_hidden.is_empty());
+    assert_eq!(report.ignored, vec![glow.to_string()]);
+    assert!(report.ignored_refused.is_empty());
+    assert!(
+        !report.masked.iter().any(|w| w.id == glow.to_string()),
+        "an ignored overlay is not reported as masked"
+    );
+
+    // Ignore without keep: everything masked.
+    let (img, report) = capture(&conn, &MaskRequest::all().ignoring(vec![glow]));
+    assert!(img.pixels.chunks(3).all(|p| p == MASK_FILL));
+    assert_eq!(report.ignored, vec![glow.to_string()]);
+}
+
+#[test]
+#[ignore = "requires a live X server; run under scripts/test-xvfb.sh"]
+fn refused_and_missing_ignore_ids_fail_closed() {
+    let conn = Conn::connect().expect("connect to Xvfb");
+    let a = make(
+        &conn,
+        Spec {
+            rect: (100, 100, 300, 200),
+            color: RED,
+            class: Some("AppA"),
+            pid: Some(7101),
+            ..Spec::default()
+        },
+    );
+    // Another process's override-redirect overlay above A (a foreign OSD).
+    let foreign = make(
+        &conn,
+        Spec {
+            rect: (0, 0, 640, 400),
+            color: GREEN,
+            override_redirect: true,
+            class: Some("Osd"),
+            pid: Some(7199),
+            ..Spec::default()
+        },
+    );
+    settle(&conn);
+    let bogus: Window = 0x07ff_fff0;
+    let (img, report) = capture(
+        &conn,
+        &MaskRequest::keep(vec![a]).ignoring(vec![foreign, bogus]),
+    );
+    assert_eq!(
+        px(&img, 150, 150),
+        MASK_FILL,
+        "foreign overlay still masks A"
+    );
+    assert_eq!(report.kept_hidden, vec![a.to_string()]);
+    assert!(report.ignored.is_empty());
+    assert_eq!(report.ignored_missing, vec![bogus.to_string()]);
+    assert_eq!(report.ignored_refused.len(), 1);
+    assert_eq!(report.ignored_refused[0].id, foreign.to_string());
+    assert_eq!(report.ignored_refused[0].reason, "foreign_pid");
+    assert_eq!(report.ignored_refused[0].pid, Some(7199));
+    assert_eq!(report.ignored_refused[0].caller_pid, Some(caller_pid()));
+    assert!(report.masked.iter().any(|w| w.id == foreign.to_string()));
+
+    // A managed (WM_STATE) window of the caller, like its main window, is
+    // refused even with the caller's pid.
+    let main_win = make(
+        &conn,
+        Spec {
+            rect: (150, 150, 100, 100),
+            color: GRAY,
+            class: Some("Claude"),
+            pid: Some(caller_pid()),
+            wm_state: true,
+            ..Spec::default()
+        },
+    );
+    settle(&conn);
+    let (img, report) = capture(&conn, &MaskRequest::keep(vec![a]).ignoring(vec![main_win]));
+    assert_eq!(px(&img, 200, 200), MASK_FILL);
+    assert_eq!(report.ignored_refused[0].reason, "not_override_redirect");
+}
+
+#[test]
+#[ignore = "requires a live X server; run under scripts/test-xvfb.sh"]
+fn zoom_with_ignored_overlay() {
+    let conn = Conn::connect().expect("connect to Xvfb");
+    let a = make(
+        &conn,
+        Spec {
+            rect: (600, 400, 100, 100),
+            color: RED,
+            class: Some("AppA"),
+            pid: Some(7201),
+            ..Spec::default()
+        },
+    );
+    // Overlay covering only the top half of the zoom region.
+    let glow = make(
+        &conn,
+        Spec {
+            rect: (500, 300, 300, 125),
+            color: YELLOW,
+            override_redirect: true,
+            class: Some("Claude"),
+            pid: Some(caller_pid()),
+            ..Spec::default()
+        },
+    );
+    settle(&conn);
+    let monitor = conn.resolve_monitor(None).unwrap();
+    let region = (550 - monitor.x, 350 - monitor.y, 100, 100);
+    let rect = RootRect {
+        x: 550,
+        y: 350,
+        width: 100,
+        height: 100,
+    };
+    let (img, report) = capture_with_mask(
+        &conn,
+        rect,
+        Some(&MaskRequest::keep(vec![a]).ignoring(vec![glow])),
+    )
+    .unwrap();
+    let report = report.unwrap();
+    assert_eq!(
+        px(&img, 75, 60),
+        rgb(YELLOW),
+        "A under the overlay (overlay pixels)"
+    );
+    assert_eq!(px(&img, 75, 90), rgb(RED), "A below the overlay");
+    assert_eq!(px(&img, 25, 25), MASK_FILL, "root under the overlay");
+    assert_eq!(report.kept, vec![a.to_string()]);
+    let out = crate::capture::zoom(
+        &conn,
+        Some(&monitor.name),
+        region,
+        Some(&MaskRequest::keep(vec![a]).ignoring(vec![glow])),
+    )
+    .unwrap();
+    let json = serde_json::to_value(&out).unwrap();
+    assert_eq!(json["mask"]["ignored"][0], glow.to_string());
+    assert_eq!(json["mask"]["kept"][0], a.to_string());
 }

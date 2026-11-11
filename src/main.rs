@@ -158,7 +158,11 @@ fn run() -> Result<ExitCode> {
             display,
             mask: mask_args,
         } => {
-            let request = mask::MaskRequest::from_cli(mask_args.keep_windows, mask_args.mask_all);
+            let request = mask::MaskRequest::from_cli(
+                mask_args.keep_windows,
+                mask_args.mask_all,
+                mask_args.ignore_windows,
+            );
             let conn = Conn::connect()?;
             print_json(&capture::screenshot(
                 &conn,
@@ -174,7 +178,11 @@ fn run() -> Result<ExitCode> {
             h,
             mask: mask_args,
         } => {
-            let request = mask::MaskRequest::from_cli(mask_args.keep_windows, mask_args.mask_all);
+            let request = mask::MaskRequest::from_cli(
+                mask_args.keep_windows,
+                mask_args.mask_all,
+                mask_args.ignore_windows,
+            );
             let conn = Conn::connect()?;
             print_json(&capture::zoom(
                 &conn,

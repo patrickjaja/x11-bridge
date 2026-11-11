@@ -174,6 +174,17 @@ pub struct DoctorContract {
 pub struct DoctorCapabilities {
     /// `screenshot`/`zoom` accept `--keep-window <id>` / `--mask-all`.
     pub screenshot_mask: bool,
+    /// Mask mode takes `--ignore-window <id>` (the caller's own see-through
+    /// overlays are treated as absent; `mask.ignored*` in the result).
+    pub screenshot_mask_ignore: bool,
+    /// Whether a compositing manager runs on this screen right now (an owner
+    /// of the `_NET_WM_CM_S<screen>` selection), read on every `doctor`.
+    /// `null` = unknown (no X display, or the selection could not be read;
+    /// `compositing_error` says why). Without one, transparent windows are
+    /// drawn opaque: callers should treat false AND null as "no compositor".
+    pub compositing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compositing_error: Option<String>,
 }
 
 /// X server details reported by `doctor` when reachable (bridge-specific extras).

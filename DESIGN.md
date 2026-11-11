@@ -39,8 +39,8 @@ the kwin bridge emits them and how the JS reads them).
 |---|---|---|
 | `doctor` | `{display, server_vendor, protocol_major, protocol_minor, screen_count, extensions:{xtest,randr,xfixes}, keyboard:{min_keycode,max_keycode}}` | human-facing only; not parsed by JS |
 | `screens` | `[{id, name, geometry:{x,y,width,height}, scale, refresh_millihz, is_active, is_primary}]` | `mapRustScreenToDisplay` reads `geometry.*`, `scale`, `is_primary`, `name`, `id` (→ `_bridgeId`) |
-| `screenshot [--display N] [--keep-window ID]... [--mask-all]` | `{base64, width, height, displayWidth, displayHeight, displayId, originX, originY, mask?}` (camelCase) | `screenshotResultFromRust` reads `result.displayWidth`/`displayHeight`/`originX`/`originY` |
-| `zoom --x --y --w --h [--display N] [--keep-window ID]... [--mask-all]` | `{base64, width, height, mask?}` | `zoom` reads `result.base64`/`width`/`height` |
+| `screenshot [--display N] [--keep-window ID]... [--mask-all] [--ignore-window ID]...` | `{base64, width, height, displayWidth, displayHeight, displayId, originX, originY, mask?}` (camelCase) | `screenshotResultFromRust` reads `result.displayWidth`/`displayHeight`/`originX`/`originY` |
+| `zoom --x --y --w --h [--display N] [--keep-window ID]... [--mask-all] [--ignore-window ID]...` | `{base64, width, height, mask?}` | `zoom` reads `result.base64`/`width`/`height` |
 | `windows` | `[{id, title, geometry, pid, desktop_file_name, resource_class, resource_name, window_role, window_type, is_dock, is_desktop, is_visible, is_minimized, is_normal_window, is_dialog, transient, transient_for, output, stacking_order, is_active, exclude_from_capture, keep_above}]` (snake_case) | `normalizeBundleIdFromWindow`, `dockableWindow`, `findHostMainWindow` read `desktop_file_name`, `resource_class`, `resource_name`, `is_minimized`, `is_visible`, `is_dialog`, `is_normal_window`, `is_active`, `stacking_order`, `output`, `keep_above`, `transient`, `transient_for` |
 | `cursor-position` | `{x, y}` | `getCursorPosition` reads `result.x`/`result.y` |
 | `frontmost-app` | `{bundleId, displayName}` (camelCase), or JSON `null` when no window is active | `_appRefFromCommand` reads `result.bundleId`/`displayName` and maps anything else to no app |
@@ -114,7 +114,9 @@ WM (`__SWM_VROOT`) is refused.
 Output adds `mask`:
 `{mode: "keep"|"all", fill: "#1E1E1E", kept: [id], kept_hidden: [id],
 kept_missing: [id], auto_kept: [id], masked: [{id, frame, pid,
-desktop_file_name, resource_class, resource_name, override_redirect}]}`.
+desktop_file_name, resource_class, resource_name, override_redirect}],
+ignored: [id], ignored_missing: [id], ignored_refused: [{id, reason, pid?,
+caller_pid?}]}`.
 `kept` = requested ids with visible pixels in the image; `kept_hidden` =
 requested, viewable, but no visible pixel (covered, or outside the region);
 `auto_kept` = windows kept through ownership; `masked` = masked windows with
@@ -129,6 +131,64 @@ moved or closed within that frame, or a running effect (animation, wobbly
 windows, desktop cube), can leave stale pixels in a kept region. A compositor
 that paints into its own full-screen override-redirect window instead of the
 Composite overlay masks everything.
+
+### Ignored windows (`--ignore-window <id>`)
+
+Claude's Computer Use glow ("Claude is using your computer") and its teach
+overlay are full-display, transparent, click-through Electron windows kept
+above everything (Electron creates them override-redirect: `focusable:false`).
+Upstream hides them from capture with `setContentProtection`, which does
+nothing on X11, so without help they own every pixel and a kept window under
+them is reported in `kept_hidden` with a fully masked image.
+
+`--ignore-window <id>` (repeatable; ids as for `--keep-window`, walked up to
+the root child; mask mode only, a no-op otherwise) names such an overlay. An
+ignored layer owns no pixel: what is under it belongs to the next layer down,
+so a pixel shows only when the topmost non-ignored layer is kept. Ignoring
+never widens what is kept. The pixels themselves are still `GetImage`'s, i.e.
+the composited screen: over a kept window the image shows the overlay's rim or
+card on top of the app, exactly as the user sees it (an overlay that is opaque,
+e.g. the glow without a compositing manager, which Electron then draws black,
+stays opaque in the image).
+
+An id is honoured only when all of these hold, else it fails closed (an
+ordinary layer, masked unless kept):
+
+- it exists and is viewable (else `ignored_missing`);
+- its root child is override-redirect: never a WM-managed window such as the
+  caller's main window or a dialog (`not_override_redirect`);
+- the root child's `_NET_WM_PID` is the bridge's parent pid (`getppid`; the app
+  execs the bridge directly; Chromium sets `_NET_WM_PID` to its browser
+  process on every X window) (`foreign_pid`, `no_pid`, `no_caller_pid` when
+  the parent is gone);
+- it is not kept, directly or through ownership: keep wins (`kept`).
+
+So a wrong id from the caller can only ever let the caller's own
+override-redirect pixels through, never another process's window. The input
+shape is deliberately not checked: Electron's click-through leaves a 1x1 input
+region rather than an empty one, and the teach overlay turns input back on
+while the pointer is over its card.
+
+`mask` adds `ignored: [id]`, `ignored_missing: [id]` and
+`ignored_refused: [{id, reason, pid?, caller_pid?}]`; ignored windows are not
+listed in `masked`. `doctor` reports `capabilities.screenshot_mask_ignore:
+true`.
+
+## Compositing manager (`doctor.capabilities.compositing`)
+
+`doctor` reports whether a compositing manager runs on the bridge's screen
+right now: `true` when the EWMH selection `_NET_WM_CM_S<screen>` has an owner,
+`false` when it has none (bare X, i3, openbox, xfwm4 with its compositor off).
+It is read on every `doctor` call (one InternAtom + one GetSelectionOwner), so
+a compositor switched on or off at run time shows on the next call. When it
+cannot be read (no X display, a request error) it is `null` with
+`compositing_error`; `doctor` still exits 0.
+
+Why it matters: without a compositing manager X has no alpha blending, so a
+"transparent" window (Electron `transparent: true`, such as Claude's Computer
+Use glow) is drawn opaque, typically black over the whole area. Consumers
+should treat `false` and `null` alike as "no compositor": do not show
+see-through overlays.
 
 ## Key-spec grammar
 

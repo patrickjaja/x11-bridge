@@ -28,10 +28,35 @@
 //!    of a kept layer, and an override-redirect layer (menu, tooltip, dropdown)
 //!    is kept when it is stacked above a kept layer of the same app: same
 //!    `WM_CLIENT_LEADER`, or same `_NET_WM_PID` with a compatible `WM_CLASS`.
-//! 5. Painter's algorithm over the capture rectangle: each pixel belongs to the
-//!    topmost layer covering it (or to the root). A pixel is kept only when that
-//!    owner is a kept layer. A kept window covered by a masked one is masked
-//!    there: `GetImage` only has the top pixels.
+//! 5. Ignored layers (`--ignore-window`, see below) are taken out: they own no
+//!    pixel, so what is under them belongs to the next layer down.
+//! 6. Painter's algorithm over the capture rectangle: each pixel belongs to the
+//!    topmost non-ignored layer covering it (or to the root). A pixel is kept
+//!    only when that owner is a kept layer. A kept window covered by a masked one
+//!    is masked there: `GetImage` only has the top pixels.
+//!
+//! ## Ignored windows (`--ignore-window <id>`)
+//!
+//! The caller's own see-through overlays (Claude's Computer Use glow and teach
+//! overlay: full-display, transparent, click-through, always on top) sit above
+//! every app, so without this a kept window under them has no pixel of its own.
+//! An ignored layer is treated as absent: neither kept nor masked, it hides
+//! nothing below it. Its own pixels stay in the image where the layer below is
+//! kept (`GetImage` returns the composited screen: the glow's rim over the app),
+//! and are masked everywhere else. Ignoring never widens what is kept.
+//!
+//! An id is honoured only when its root child is (a) viewable, (b)
+//! override-redirect (not a window the WM manages: never the caller's main
+//! window or a dialog), (c) owned by the process that started this bridge:
+//! `_NET_WM_PID` equals our parent pid (`getppid`; the app spawns the bridge
+//! directly), and (d) not kept (directly or through ownership; keep wins).
+//! Anything else fails closed: an id that does not exist or is not viewable is
+//! `ignored_missing`, an id that fails (b)-(d) is `ignored_refused` with the
+//! reason, and both stay ordinary layers (masked unless kept). So a wrong id
+//! from the caller can only ever let the caller's own override-redirect pixels
+//! through, never another app's window. The input shape is deliberately not
+//! checked: the teach overlay turns input back on while the pointer is over its
+//! card.
 //!
 //! Any failure while reading the tree fails the command: an image is never
 //! emitted unmasked when masking was requested.
@@ -54,29 +79,67 @@ pub const MASK_FILL_HEX: &str = "#1E1E1E";
 
 /// What the caller asked to keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MaskRequest {
+pub enum KeepSet {
     /// `--mask-all`: nothing is kept, every pixel is masked.
     All,
     /// `--keep-window <id>...`: keep only these windows (and what they own).
     Keep(Vec<Window>),
 }
 
+/// A mask-mode request: what to keep, and the caller's own see-through
+/// overlays to treat as absent (`--ignore-window`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskRequest {
+    pub keep: KeepSet,
+    pub ignore: Vec<Window>,
+}
+
 impl MaskRequest {
-    /// Build from the CLI flags. `None` = no mask mode (unchanged behaviour).
-    pub fn from_cli(keep_windows: Vec<Window>, mask_all: bool) -> Option<Self> {
-        if mask_all {
-            Some(MaskRequest::All)
-        } else if keep_windows.is_empty() {
-            None
-        } else {
-            Some(MaskRequest::Keep(keep_windows))
+    /// `--mask-all` without ignored windows.
+    #[cfg(test)]
+    pub fn all() -> Self {
+        Self {
+            keep: KeepSet::All,
+            ignore: Vec::new(),
         }
     }
 
+    /// `--keep-window <ids>` without ignored windows.
+    #[cfg(test)]
+    pub fn keep(ids: Vec<Window>) -> Self {
+        Self {
+            keep: KeepSet::Keep(ids),
+            ignore: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn ignoring(mut self, ids: Vec<Window>) -> Self {
+        self.ignore = ids;
+        self
+    }
+
+    /// Build from the CLI flags. `None` = no mask mode (unchanged behaviour;
+    /// `--ignore-window` alone does nothing).
+    pub fn from_cli(
+        keep_windows: Vec<Window>,
+        mask_all: bool,
+        ignore: Vec<Window>,
+    ) -> Option<Self> {
+        let keep = if mask_all {
+            KeepSet::All
+        } else if keep_windows.is_empty() {
+            return None;
+        } else {
+            KeepSet::Keep(keep_windows)
+        };
+        Some(Self { keep, ignore })
+    }
+
     fn ids(&self) -> &[Window] {
-        match self {
-            MaskRequest::All => &[],
-            MaskRequest::Keep(ids) => ids,
+        match &self.keep {
+            KeepSet::All => &[],
+            KeepSet::Keep(ids) => ids,
         }
     }
 }
@@ -101,6 +164,26 @@ pub struct MaskReport {
     pub auto_kept: Vec<String>,
     /// Masked windows with at least one pixel in the image, topmost first.
     pub masked: Vec<MaskedWindow>,
+    /// `--ignore-window` ids honoured: treated as absent (see the module doc).
+    pub ignored: Vec<String>,
+    /// `--ignore-window` ids that do not exist or are not viewable.
+    pub ignored_missing: Vec<String>,
+    /// `--ignore-window` ids refused by the safety rules; they stay ordinary
+    /// layers (masked unless kept).
+    pub ignored_refused: Vec<IgnoreRefused>,
+}
+
+/// An `--ignore-window` id that was not honoured, and why.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IgnoreRefused {
+    pub id: String,
+    /// `not_override_redirect`, `foreign_pid` (with `pid` / `caller_pid`),
+    /// `no_pid`, `no_caller_pid` or `kept`.
+    pub reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_pid: Option<u32>,
 }
 
 /// A masked window, identified like a `windows` entry (no title: the title of
@@ -265,6 +348,62 @@ pub fn decide_kept(layers: &[Layer], direct: &[bool]) -> Vec<bool> {
     }
 }
 
+/// Outcome of one `--ignore-window` id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IgnoreOutcome {
+    /// Honoured: layer index treated as absent.
+    Ignored(usize),
+    /// Does not exist / not viewable / the root.
+    Missing,
+    Refused {
+        reason: &'static str,
+        pid: Option<u32>,
+    },
+}
+
+/// Apply the safety rules (module doc) to each resolved `--ignore-window` id.
+/// `ignore_of[i]` is the layer the i-th id resolved to; `caller_pid` is the
+/// bridge's parent pid. Returns the per-layer "ignored" flags and the outcome of
+/// each id (in request order).
+pub fn decide_ignored(
+    layers: &[Layer],
+    kept: &[bool],
+    ignore_of: &[Option<usize>],
+    caller_pid: Option<u32>,
+) -> (Vec<bool>, Vec<IgnoreOutcome>) {
+    let mut ignored = vec![false; layers.len()];
+    let outcomes = ignore_of
+        .iter()
+        .map(|resolved| {
+            let Some(i) = *resolved else {
+                return IgnoreOutcome::Missing;
+            };
+            let layer = &layers[i];
+            let refuse = |reason| IgnoreOutcome::Refused {
+                reason,
+                pid: layer.pid,
+            };
+            if kept[i] {
+                return refuse("kept");
+            }
+            if !layer.override_redirect {
+                return refuse("not_override_redirect");
+            }
+            let Some(caller) = caller_pid.filter(|&p| p > 1) else {
+                return refuse("no_caller_pid");
+            };
+            match layer.pid {
+                None | Some(0) => return refuse("no_pid"),
+                Some(pid) if pid != caller => return refuse("foreign_pid"),
+                Some(_) => {}
+            }
+            ignored[i] = true;
+            IgnoreOutcome::Ignored(i)
+        })
+        .collect();
+    (ignored, outcomes)
+}
+
 /// Per-pixel owner map of a capture rectangle: 0 = root, `i + 1` = layer `i`.
 pub struct Coverage {
     area: PxRect,
@@ -272,8 +411,9 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Painter's algorithm, bottom to top.
-    pub fn build(area: PxRect, layers: &[Layer]) -> Result<Self> {
+    /// Painter's algorithm, bottom to top. Layers flagged in `ignored` own no
+    /// pixel (empty slice = none ignored).
+    pub fn build(area: PxRect, layers: &[Layer], ignored: &[bool]) -> Result<Self> {
         if area.is_empty() {
             bail!("mask area is empty");
         }
@@ -283,6 +423,9 @@ impl Coverage {
         let w = area.width as usize;
         let mut owners = vec![0u16; w * area.height as usize];
         for (index, layer) in layers.iter().enumerate() {
+            if ignored.get(index).copied().unwrap_or(false) {
+                continue;
+            }
             let Some(rect) = layer.rect.and_then(|r| r.intersect(&area)) else {
                 continue;
             };
@@ -342,12 +485,14 @@ pub fn build_report(
     direct_of: &[Option<usize>],
     kept: &[bool],
     visible: &[bool],
+    ignore: (&[IgnoreOutcome], Option<u32>),
 ) -> MaskReport {
     let ids = request.ids();
+    let (ignore_outcomes, caller_pid) = ignore;
     let mut report = MaskReport {
-        mode: match request {
-            MaskRequest::All => "all",
-            MaskRequest::Keep(_) => "keep",
+        mode: match request.keep {
+            KeepSet::All => "all",
+            KeepSet::Keep(_) => "keep",
         },
         fill: MASK_FILL_HEX,
         kept: Vec::new(),
@@ -355,7 +500,26 @@ pub fn build_report(
         kept_missing: Vec::new(),
         auto_kept: Vec::new(),
         masked: Vec::new(),
+        ignored: Vec::new(),
+        ignored_missing: Vec::new(),
+        ignored_refused: Vec::new(),
     };
+    let mut seen_ignore = HashSet::new();
+    for (&id, outcome) in request.ignore.iter().zip(ignore_outcomes) {
+        if !seen_ignore.insert(id) {
+            continue;
+        }
+        match outcome {
+            IgnoreOutcome::Ignored(_) => report.ignored.push(id.to_string()),
+            IgnoreOutcome::Missing => report.ignored_missing.push(id.to_string()),
+            IgnoreOutcome::Refused { reason, pid } => report.ignored_refused.push(IgnoreRefused {
+                id: id.to_string(),
+                reason,
+                pid: *pid,
+                caller_pid: (*reason == "foreign_pid").then_some(caller_pid).flatten(),
+            }),
+        }
+    }
     let mut seen_ids = HashSet::new();
     for (&id, layer) in ids.iter().zip(direct_of) {
         if !seen_ids.insert(id) {
@@ -659,9 +823,20 @@ pub fn resolve_requested(
     layers: &[Layer],
     request: &MaskRequest,
 ) -> Result<Vec<Option<usize>>> {
-    request
-        .ids()
-        .iter()
+    resolve_ids(conn, layers, request.ids())
+}
+
+/// Same as `resolve_requested`, for the `--ignore-window` ids.
+pub fn resolve_ignored(
+    conn: &Conn,
+    layers: &[Layer],
+    request: &MaskRequest,
+) -> Result<Vec<Option<usize>>> {
+    resolve_ids(conn, layers, &request.ignore)
+}
+
+fn resolve_ids(conn: &Conn, layers: &[Layer], ids: &[Window]) -> Result<Vec<Option<usize>>> {
+    ids.iter()
         .map(|&id| resolve_one(conn, layers, id))
         .collect()
 }
@@ -719,7 +894,7 @@ mod tests {
 
     fn kept_grid(area: PxRect, layers: &[Layer], direct: &[bool]) -> (Coverage, Vec<bool>) {
         let kept = decide_kept(layers, direct);
-        (Coverage::build(area, layers).unwrap(), kept)
+        (Coverage::build(area, layers, &[]).unwrap(), kept)
     }
 
     #[test]
@@ -782,7 +957,7 @@ mod tests {
         assert_eq!(cov.visible(1), vec![true]);
         // Entirely outside the area: not visible.
         let layers = [layer(1, PxRect::new(-50, -50, 10, 10))];
-        let cov = Coverage::build(area, &layers).unwrap();
+        let cov = Coverage::build(area, &layers, &[]).unwrap();
         assert_eq!(cov.visible(1), vec![false]);
     }
 
@@ -928,16 +1103,16 @@ mod tests {
                 ..layer(4, PxRect::new(25, 0, 2, 2))
             },
         ];
-        let request = MaskRequest::Keep(vec![1, 3, 99, 3]);
+        let request = MaskRequest::keep(vec![1, 3, 99, 3]);
         let direct_of = vec![Some(0), Some(2), None, Some(2)];
         let mut direct = vec![false; 4];
         for i in direct_of.iter().flatten() {
             direct[*i] = true;
         }
         let kept = decide_kept(&layers, &direct);
-        let cov = Coverage::build(PxRect::new(0, 0, 40, 10), &layers).unwrap();
+        let cov = Coverage::build(PxRect::new(0, 0, 40, 10), &layers, &[]).unwrap();
         let visible = cov.visible(layers.len());
-        let report = build_report(&request, &layers, &direct_of, &kept, &visible);
+        let report = build_report(&request, &layers, &direct_of, &kept, &visible, (&[], None));
         assert_eq!(report.mode, "keep");
         assert_eq!(report.kept, vec!["3"]);
         assert_eq!(report.kept_hidden, vec!["1"]);
@@ -952,12 +1127,230 @@ mod tests {
 
     #[test]
     fn request_from_cli() {
-        assert_eq!(MaskRequest::from_cli(vec![], false), None);
-        assert_eq!(MaskRequest::from_cli(vec![], true), Some(MaskRequest::All));
+        assert_eq!(MaskRequest::from_cli(vec![], false, vec![]), None);
         assert_eq!(
-            MaskRequest::from_cli(vec![5], false),
-            Some(MaskRequest::Keep(vec![5]))
+            MaskRequest::from_cli(vec![], true, vec![]),
+            Some(MaskRequest::all())
         );
+        assert_eq!(
+            MaskRequest::from_cli(vec![5], false, vec![]),
+            Some(MaskRequest::keep(vec![5]))
+        );
+        // --ignore-window does nothing outside mask mode.
+        assert_eq!(MaskRequest::from_cli(vec![], false, vec![9]), None);
+        assert_eq!(
+            MaskRequest::from_cli(vec![5], false, vec![9]),
+            Some(MaskRequest::keep(vec![5]).ignoring(vec![9]))
+        );
+    }
+
+    /// The glow: a full-area override-redirect layer of the caller (pid 100),
+    /// above a kept app (pid 200) and a masked app (pid 300).
+    fn glow_scene() -> Vec<Layer> {
+        let app = |frame, pid, rect| Layer {
+            pid: Some(pid),
+            ..layer(frame, rect)
+        };
+        vec![
+            app(1, 200, PxRect::new(0, 0, 10, 10)),  // kept app
+            app(2, 300, PxRect::new(20, 0, 10, 10)), // other app
+            Layer {
+                override_redirect: true,
+                pid: Some(100),
+                ..layer(3, PxRect::new(0, 0, 40, 10))
+            },
+        ]
+    }
+
+    fn ignore_run(
+        layers: &[Layer],
+        direct: &[bool],
+        ignore_of: &[Option<usize>],
+        caller: Option<u32>,
+    ) -> (Coverage, Vec<bool>, Vec<IgnoreOutcome>) {
+        let kept = decide_kept(layers, direct);
+        let (ignored, outcomes) = decide_ignored(layers, &kept, ignore_of, caller);
+        let cov = Coverage::build(PxRect::new(0, 0, 40, 10), layers, &ignored).unwrap();
+        (cov, kept, outcomes)
+    }
+
+    #[test]
+    fn overlay_above_everything_masks_kept_window_without_ignore() {
+        let layers = glow_scene();
+        let (cov, kept, _) = ignore_run(&layers, &[true, false, false], &[], Some(100));
+        assert!(!cov.is_kept(&kept, 5, 5), "the overlay owns the pixel");
+        assert_eq!(cov.visible(3), vec![false, false, true]);
+    }
+
+    #[test]
+    fn ignored_overlay_shows_kept_window_and_still_masks_the_rest() {
+        let layers = glow_scene();
+        let (cov, kept, out) = ignore_run(&layers, &[true, false, false], &[Some(2)], Some(100));
+        assert_eq!(out, vec![IgnoreOutcome::Ignored(2)]);
+        assert!(cov.is_kept(&kept, 5, 5), "kept app under the overlay shows");
+        assert!(
+            !cov.is_kept(&kept, 25, 5),
+            "other app under the overlay stays masked"
+        );
+        assert!(
+            !cov.is_kept(&kept, 15, 5),
+            "root under the overlay stays masked"
+        );
+        assert_eq!(
+            cov.visible(3),
+            vec![true, true, false],
+            "overlay owns nothing"
+        );
+    }
+
+    #[test]
+    fn ignore_without_keep_masks_everything() {
+        let layers = glow_scene();
+        let (cov, kept, out) = ignore_run(&layers, &[false, false, false], &[Some(2)], Some(100));
+        assert_eq!(out, vec![IgnoreOutcome::Ignored(2)]);
+        let mut pixels = vec![0xAAu8; 40 * 10 * 3];
+        cov.apply(&kept, &mut pixels).unwrap();
+        assert!(pixels.chunks(3).all(|p| p == MASK_FILL));
+    }
+
+    #[test]
+    fn partially_covering_overlay() {
+        // Overlay covers only the right half of the kept app.
+        let mut layers = glow_scene();
+        layers[2].rect = Some(PxRect::new(5, 0, 35, 10));
+        let (cov, kept, _) = ignore_run(&layers, &[true, false, false], &[], Some(100));
+        assert!(cov.is_kept(&kept, 2, 5), "uncovered part shows");
+        assert!(
+            !cov.is_kept(&kept, 7, 5),
+            "covered part masked without ignore"
+        );
+        let (cov, kept, _) = ignore_run(&layers, &[true, false, false], &[Some(2)], Some(100));
+        assert!(cov.is_kept(&kept, 2, 5));
+        assert!(cov.is_kept(&kept, 7, 5), "covered part shows with ignore");
+        assert!(!cov.is_kept(&kept, 25, 5));
+    }
+
+    #[test]
+    fn ignore_refusals_fail_closed() {
+        let layers = glow_scene();
+        let direct = [true, false, false];
+        // Foreign pid: the caller is not the overlay's owner.
+        let (cov, kept, out) = ignore_run(&layers, &direct, &[Some(2)], Some(4242));
+        assert_eq!(
+            out,
+            vec![IgnoreOutcome::Refused {
+                reason: "foreign_pid",
+                pid: Some(100)
+            }]
+        );
+        assert!(!cov.is_kept(&kept, 5, 5), "refused overlay still masks");
+        // No caller pid (orphaned bridge: parent pid 1).
+        let (_, _, out) = ignore_run(&layers, &direct, &[Some(2)], Some(1));
+        assert!(matches!(
+            out[0],
+            IgnoreOutcome::Refused {
+                reason: "no_caller_pid",
+                ..
+            }
+        ));
+        // A managed (non override-redirect) window of the caller, e.g. its
+        // main window above the kept app.
+        let mut managed = glow_scene();
+        managed[2].override_redirect = false;
+        let (cov, kept, out) = ignore_run(&managed, &direct, &[Some(2)], Some(100));
+        assert!(matches!(
+            out[0],
+            IgnoreOutcome::Refused {
+                reason: "not_override_redirect",
+                ..
+            }
+        ));
+        assert!(!cov.is_kept(&kept, 5, 5));
+        // Without _NET_WM_PID.
+        let mut nopid = glow_scene();
+        nopid[2].pid = None;
+        let (_, _, out) = ignore_run(&nopid, &direct, &[Some(2)], Some(100));
+        assert!(matches!(
+            out[0],
+            IgnoreOutcome::Refused {
+                reason: "no_pid",
+                ..
+            }
+        ));
+        // Keep wins: the kept app itself cannot be ignored.
+        let (cov, kept, out) = ignore_run(&layers, &direct, &[Some(0)], Some(200));
+        assert!(matches!(
+            out[0],
+            IgnoreOutcome::Refused { reason: "kept", .. }
+        ));
+        assert!(!cov.is_kept(&kept, 5, 5), "overlay still above it");
+        // Missing.
+        let (_, _, out) = ignore_run(&layers, &direct, &[None], Some(100));
+        assert_eq!(out, vec![IgnoreOutcome::Missing]);
+    }
+
+    #[test]
+    fn auto_kept_overlay_is_not_ignored() {
+        // An override-redirect layer of the kept app's own process is auto-kept
+        // (menu rule); keep wins over ignore.
+        let mut layers = glow_scene();
+        layers[2].pid = Some(200);
+        let (_, kept, out) = ignore_run(&layers, &[true, false, false], &[Some(2)], Some(200));
+        assert!(kept[2]);
+        assert!(matches!(
+            out[0],
+            IgnoreOutcome::Refused { reason: "kept", .. }
+        ));
+    }
+
+    #[test]
+    fn report_lists_ignore_outcomes() {
+        let layers = glow_scene();
+        let request = MaskRequest::keep(vec![1]).ignoring(vec![3, 77, 2, 3]);
+        let direct_of = vec![Some(0)];
+        let kept = decide_kept(&layers, &[true, false, false]);
+        let (ignored, outcomes) = decide_ignored(
+            &layers,
+            &kept,
+            &[Some(2), None, Some(1), Some(2)],
+            Some(100),
+        );
+        let cov = Coverage::build(PxRect::new(0, 0, 40, 10), &layers, &ignored).unwrap();
+        let visible = cov.visible(layers.len());
+        let report = build_report(
+            &request,
+            &layers,
+            &direct_of,
+            &kept,
+            &visible,
+            (&outcomes, Some(100)),
+        );
+        assert_eq!(report.kept, vec!["1"]);
+        assert!(report.kept_hidden.is_empty());
+        assert_eq!(report.ignored, vec!["3"]);
+        assert_eq!(report.ignored_missing, vec!["77"]);
+        assert_eq!(report.ignored_refused.len(), 1);
+        assert_eq!(report.ignored_refused[0].id, "2");
+        assert_eq!(report.ignored_refused[0].reason, "not_override_redirect");
+        // The ignored overlay is not reported as masked; the other app is.
+        let masked: Vec<&str> = report.masked.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(masked, vec!["2"]);
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["ignored_refused"][0].get("caller_pid").is_none());
+        // foreign_pid carries both pids.
+        let (_, outcomes) = decide_ignored(&layers, &kept, &[Some(2)], Some(5));
+        let report = build_report(
+            &MaskRequest::keep(vec![1]).ignoring(vec![3]),
+            &layers,
+            &direct_of,
+            &kept,
+            &visible,
+            (&outcomes, Some(5)),
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["ignored_refused"][0]["reason"], "foreign_pid");
+        assert_eq!(json["ignored_refused"][0]["pid"], 100);
+        assert_eq!(json["ignored_refused"][0]["caller_pid"], 5);
     }
 
     #[test]

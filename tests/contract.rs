@@ -233,6 +233,10 @@ fn doctor_reports_screenshot_mask_capability() {
     let v: Value = serde_json::from_str(stdout(&out).trim()).expect("one JSON value");
     assert_eq!(v["contract"], 1);
     assert_eq!(v["capabilities"]["screenshot_mask"], true);
+    assert_eq!(v["capabilities"]["screenshot_mask_ignore"], true);
+    // No X display: compositing is unknown (null) with a reason, doctor exits 0.
+    assert!(v["capabilities"]["compositing"].is_null(), "{v}");
+    assert!(v["capabilities"]["compositing_error"].is_string(), "{v}");
 }
 
 #[test]
@@ -240,6 +244,17 @@ fn mask_flags_parse_and_conflict() {
     let ok: &[&[&str]] = &[
         &["screenshot", "--keep-window", "12583107", "--help"],
         &["screenshot", "--mask-all", "--help"],
+        &[
+            "screenshot",
+            "--keep-window",
+            "1",
+            "--ignore-window",
+            "0x2000005",
+            "--ignore-window",
+            "7",
+            "--help",
+        ],
+        &["screenshot", "--ignore-window", "7", "--help"],
         &[
             "zoom",
             "--x",
@@ -263,6 +278,7 @@ fn mask_flags_parse_and_conflict() {
     let usage: &[&[&str]] = &[
         &["screenshot", "--keep-window", "1", "--mask-all"],
         &["screenshot", "--keep-window", "notanid"],
+        &["screenshot", "--mask-all", "--ignore-window", "notanid"],
         &[
             "zoom",
             "--x",

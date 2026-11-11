@@ -99,11 +99,11 @@ failure it prints a message to stderr and exits 1 (clap parse errors exit 2).
 
 | Subcommand | Purpose |
 |---|---|
-| `doctor` | X server / extension / keyboard diagnostics (human-facing) |
+| `doctor` | X server / extension / keyboard diagnostics; `capabilities` (mask flags, `compositing`: whether a compositing manager runs now) |
 | `screens` | Enumerate monitors (RandR) |
 | `windows` | Enumerate windows (EWMH) |
-| `screenshot [--display N] [--keep-window ID]... [--mask-all]` | Capture a full monitor; mask mode hides every window not kept |
-| `zoom --display N --x --y --w --h [--keep-window ID]... [--mask-all]` | Capture a region within a monitor (same mask mode) |
+| `screenshot [--display N] [--keep-window ID]... [--mask-all] [--ignore-window ID]...` | Capture a full monitor; mask mode hides every window not kept, looking through the caller's own see-through overlays |
+| `zoom --display N --x --y --w --h [--keep-window ID]... [--mask-all] [--ignore-window ID]...` | Capture a region within a monitor (same mask mode) |
 | `pointer-move` / `-click` / `-scroll` / `-drag` | Pointer actions (XTEST) |
 | `left-mouse-down` / `left-mouse-up` | Press/release-and-hold the left button |
 | `key-sequence --keys <spec>` | Send a key combo, e.g. `ctrl+shift+tab` |
@@ -119,6 +119,7 @@ x11-bridge screens
 x11-bridge screenshot --display eDP-1
 x11-bridge zoom --display eDP-1 --x 100 --y 100 --w 400 --h 300
 x11-bridge zoom --display eDP-1 --x 0 --y 0 --w 1920 --h 1080 --keep-window 12583107
+x11-bridge screenshot --keep-window 12583107 --ignore-window 0x1e0000c   # caller's glow overlay
 x11-bridge pointer-click --x 640 --y 480 --button left --count 2
 x11-bridge key-sequence --keys 'ctrl+shift+tab' --repeat 1
 x11-bridge type --text 'hello' --delay-ms 12

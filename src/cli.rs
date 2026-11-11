@@ -11,6 +11,14 @@ pub struct MaskArgs {
     /// Mask mode with an empty allowlist: every pixel is masked.
     #[arg(long)]
     pub mask_all: bool,
+    /// Mask mode only: treat this see-through overlay of the calling app as
+    /// absent (it hides nothing below it). Honoured only for a viewable
+    /// override-redirect window whose _NET_WM_PID is this bridge's parent
+    /// process and that is not kept; otherwise it is masked like any other
+    /// window and reported in `mask.ignored_refused` / `ignored_missing`.
+    /// Repeatable; does nothing without --keep-window / --mask-all.
+    #[arg(long = "ignore-window", value_name = "ID", value_parser = parse_window_arg)]
+    pub ignore_windows: Vec<u32>,
 }
 
 fn parse_window_arg(value: &str) -> Result<u32, String> {
