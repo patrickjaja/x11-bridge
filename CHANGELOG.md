@@ -14,8 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   client had read the new mapping. Measured under Xvfb in GTK, urxvt and
   Chrome: all lost at the default delay, the previous character typed instead
   at `--delay-ms 0`. Such characters are now bound page by page to every
-  keycode with no keysym and restored 200 ms after the last of them, once per
-  page instead of once per character.
+  keycode with no keysym, typed 50 ms after the binding and restored 200 ms
+  after the last of them, once per page instead of once per character. Below 4 ms per key a page change also
+  waits for a client reading one key per 4 ms to catch up.
 - `type` uses the layout's AltGr levels (German `@ { [ ] } \ | ~ €` need no
   remap any more) and honours Caps Lock.
 - With a second layout active (`us,de` switched to `de`), every command

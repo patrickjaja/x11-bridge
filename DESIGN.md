@@ -249,9 +249,15 @@ steps (`src/input/layout.rs`, `src/input/remap.rs`):
    bound to keycodes with no keysym in any column (no physical key of the
    layout sends them; Xvfb's German layout has 15: 8, 97, 103, ...; with none
    the last keycode is borrowed). A text is split into pages of at most that
-   many distinct characters; a page's characters are bound before its first
-   key, and the keycodes change again only 200 ms (`SETTLE_MS`) after the last
-   key typed with them - for the next page or for the restore at the end.
+   many distinct characters; a page's characters are bound 50 ms
+   (`BIND_WAIT_MS`) before its first key, and the keycodes change again only
+   200 ms (`SETTLE_MS`) after the last
+   key typed with them - for the next page or for the restore at the end. When
+   keys go out faster than 4 ms each (`--delay-ms` below 4), the change also
+   waits until a client handling one key per 4 ms (`CLIENT_KEY_MS`) could
+   have read every key sent since the page was bound: a busy client's backlog
+   otherwise still holds keys of the page (seen in GTK at `--delay-ms 0` on a
+   loaded host: 3 of 15 long texts lost characters at page changes).
 
 Why the pause: an X client translates a key event with the keymap it holds
 when it processes the event, and fetches a changed keymap only when it
@@ -261,9 +267,13 @@ with the restored map by every client that gets to the event after the
 restore. Measured under Xvfb with GTK 3, urxvt and Chrome 157: every such
 character was lost at the default 12 ms delay; with no delay the previous
 character came out instead. GTK and urxvt needed 1 ms of pause, Chrome under
-load more than 20 ms. The pause is paid once per page (and once at the end),
-not per character: a text whose off-layout characters fit one page costs
-200 ms more in total, nothing per character.
+load more than 20 ms. Chrome also applies a new keymap a little after it reads
+the notification: without the 50 ms before a page's first key, 3 of 12 long
+Chrome texts had one character of a new page typed as the character its
+keycode carried in the previous page (none of 12 with it). The pauses are
+paid once per page (and once at the end), not per character: a text whose
+off-layout characters fit one page costs 250 ms more in total, nothing per
+character.
 
 Which keycodes: Chrome under X11 takes the character from the keysym, so a
 character on a keycode without a DOM code (8) arrives; a character bound to a

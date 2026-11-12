@@ -132,7 +132,6 @@ fn combo_keycodes(remapper: &mut Remapper, keys: &[ComboKey]) -> Result<Vec<(Key
     }
     if !bound.is_empty() {
         remapper.load(&bound)?;
-        remapper.mark_used();
     }
     keys.iter()
         .map(|key| match key {
@@ -186,6 +185,8 @@ pub fn key_sequence(conn: &Conn, keys: &str, repeat: Option<u32>) -> Result<Keyb
         }
     }
     conn.sync()?;
+    // The pause before the restore counts from the last release.
+    remapper.note_key(true);
     remapper.finish()?;
 
     // Echo the raw split tokens, like the kwin bridge does.
@@ -255,13 +256,16 @@ pub fn type_text(conn: &Conn, text: &str, delay_ms: u64) -> Result<TypeActionRes
             remapper.load(&page)?;
         }
         match stroke {
-            Some(stroke) => tap(conn, &layout, stroke.keycode, stroke.shift, stroke.level3)?,
+            Some(stroke) => {
+                tap(conn, &layout, stroke.keycode, stroke.shift, stroke.level3)?;
+                remapper.note_key(false);
+            }
             None => {
                 let keycode = remapper
                     .keycode_of(keysym)
                     .ok_or_else(|| anyhow!("keysym {keysym:#x} is not bound"))?;
                 tap(conn, &layout, keycode, false, false)?;
-                remapper.mark_used();
+                remapper.note_key(true);
             }
         }
         conn.conn.flush().ok();
@@ -341,6 +345,7 @@ pub fn hold_key(conn: &Conn, keys: &[String], duration_ms: u64) -> Result<Keyboa
         fake_key(conn, shift.unwrap(), false)?;
     }
     conn.sync()?;
+    remapper.note_key(true);
     remapper.finish()?;
 
     Ok(KeyboardActionResult {

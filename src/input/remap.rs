@@ -11,16 +11,20 @@
 //!
 //! So a text's off-layout characters are bound in pages: every spare keycode
 //! (one with no keysym at all, which no physical key produces) takes one
-//! keysym, the page's characters are typed, and the keycodes change again
+//! keysym, the page's characters are typed [`BIND_WAIT_MS`] later (Chrome
+//! applies a new keymap a little after the notification), and the keycodes
+//! change again
 //! only after [`SETTLE_MS`] - for the next page, or for the restore at the
-//! end. The pause is paid once per page, not per character.
+//! end. The pause is paid once per page, not per character. When keys are
+//! sent faster than a client may read them (`--delay-ms 0`), the change also
+//! waits until a client handling a key per [`CLIENT_KEY_MS`] has caught up.
 //!
 //! The original rows are journaled in a root-window property before the first
 //! change, so a bridge killed mid-text (SIGKILL, or a timeout) leaves a record
 //! the next keyboard command uses to restore them ([`recover_stale`]).
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Keycode, Keysym, PropMode};
@@ -33,6 +37,21 @@ use crate::input::keymap::KeyboardMap;
 /// translated the keys typed with it. Chrome under load needed more than
 /// 20 ms in the Xvfb experiments; GTK and urxvt needed 1 ms.
 pub const SETTLE_MS: u64 = 200;
+
+/// Pause after binding a page, before its first key. Chrome applies a
+/// changed keymap a little after it reads the notification: without the
+/// pause, 3 of 12 long texts had one character of a new page typed as the
+/// character the same keycode carried in the previous page; with 50 ms,
+/// none of 12.
+pub const BIND_WAIT_MS: u64 = 50;
+
+/// What a client may need per key it processes. A page's keycodes change only
+/// once the client could have handled every key sent since the page was
+/// bound at this rate (plus [`SETTLE_MS`]): with `--delay-ms 0` the bridge
+/// sends faster than a busy client reads, and the backlog would otherwise
+/// still hold keys of the page when its keycodes change. At the app's 12 ms
+/// per character this never adds a wait.
+pub const CLIENT_KEY_MS: u64 = 4;
 
 /// Root-window property holding the original rows of remapped keycodes while
 /// a command has them bound: `[1, pid, keysyms_per_keycode, (keycode,
@@ -58,6 +77,13 @@ pub fn plan_pages(chars: &[Option<Keysym>], capacity: usize) -> Vec<(usize, Vec<
     pages
 }
 
+/// When bindings made at `changed` may change again: `settle` after the later
+/// of the last key on them and the time a client needs for `keys` keys.
+fn change_deadline(changed: Instant, last_used: Instant, keys: u32, settle: Duration) -> Instant {
+    let backlog = Duration::from_millis(CLIENT_KEY_MS * u64::from(keys));
+    last_used.max(changed + backlog) + settle
+}
+
 struct Slot {
     keycode: Keycode,
     original: Vec<Keysym>,
@@ -69,8 +95,11 @@ pub struct Remapper<'a> {
     conn: &'a Conn,
     per: u8,
     slots: Vec<Slot>,
-    /// A key was typed on a bound keycode since its last change.
-    used: bool,
+    /// When the bindings last changed, and how many keys were sent since.
+    changed: Option<Instant>,
+    keys_since_change: u32,
+    /// When a key was last typed on a bound keycode.
+    last_used: Option<Instant>,
     journal: Option<u32>,
     settle: Duration,
 }
@@ -90,7 +119,9 @@ impl<'a> Remapper<'a> {
             conn,
             per: map.keysyms_per_keycode() as u8,
             slots,
-            used: false,
+            changed: None,
+            keys_since_change: 0,
+            last_used: None,
             journal: None,
             settle: Duration::from_millis(SETTLE_MS),
         }
@@ -109,9 +140,26 @@ impl<'a> Remapper<'a> {
             .map(|s| s.keycode)
     }
 
-    /// Record that a key was typed on a bound keycode.
-    pub fn mark_used(&mut self) {
-        self.used = true;
+    /// Record a key sent (`bound`: on a bound keycode).
+    pub fn note_key(&mut self, bound: bool) {
+        self.keys_since_change += 1;
+        if bound {
+            self.last_used = Some(Instant::now());
+        }
+    }
+
+    /// Wait until the bindings may change: [`SETTLE_MS`] after the later of
+    /// the last key on a bound keycode and the time a client needs for the
+    /// keys sent since the last change ([`CLIENT_KEY_MS`] each).
+    fn wait_before_change(&mut self) {
+        let (Some(changed), Some(last_used)) = (self.changed, self.last_used) else {
+            return;
+        };
+        let deadline = change_deadline(changed, last_used, self.keys_since_change, self.settle);
+        let now = Instant::now();
+        if deadline > now {
+            thread::sleep(deadline - now);
+        }
     }
 
     /// Bind every keysym of `page` (at most [`capacity`](Self::capacity)),
@@ -136,9 +184,7 @@ impl<'a> Remapper<'a> {
         if changes.is_empty() {
             return Ok(());
         }
-        if self.used {
-            thread::sleep(self.settle);
-        }
+        self.wait_before_change();
         self.write_journal()?;
         for &(index, sym) in &changes {
             let row = vec![sym; usize::from(self.per.max(1))];
@@ -149,7 +195,10 @@ impl<'a> Remapper<'a> {
             self.slots[index].bound = Some(sym);
         }
         self.conn.sync()?;
-        self.used = false;
+        thread::sleep(Duration::from_millis(BIND_WAIT_MS));
+        self.changed = Some(Instant::now());
+        self.keys_since_change = 0;
+        self.last_used = None;
         Ok(())
     }
 
@@ -159,10 +208,9 @@ impl<'a> Remapper<'a> {
         if self.slots.iter().all(|s| s.bound.is_none()) {
             return Ok(());
         }
-        if self.used {
-            thread::sleep(self.settle);
-            self.used = false;
-        }
+        self.wait_before_change();
+        self.changed = None;
+        self.last_used = None;
         for slot in &mut self.slots {
             if slot.bound.take().is_some() {
                 self.conn
@@ -317,6 +365,21 @@ mod tests {
                 (6, vec![2]),
                 (7, vec![4])
             ]
+        );
+    }
+
+    #[test]
+    fn change_waits_for_the_last_key_or_the_backlog() {
+        let t0 = Instant::now();
+        let settle = Duration::from_millis(SETTLE_MS);
+        // Paced typing (12 ms per key): the last key decides.
+        let last = t0 + Duration::from_millis(12 * 50);
+        assert_eq!(change_deadline(t0, last, 50, settle), last + settle);
+        // Burst (keys sent at once): the client's backlog decides.
+        let burst = t0 + Duration::from_millis(5);
+        assert_eq!(
+            change_deadline(t0, burst, 100, settle),
+            t0 + Duration::from_millis(CLIENT_KEY_MS * 100) + settle
         );
     }
 
