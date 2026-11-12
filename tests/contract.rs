@@ -155,6 +155,38 @@ fn doctor_has_atspi_key_and_never_fails() {
 }
 
 #[test]
+fn ax_features_matches_the_crate_without_x11() {
+    let out = run(&["ax-features"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(stdout(&out).trim(), cu_atspi::features_json());
+    let v: Value = serde_json::from_str(stdout(&out).trim()).expect("one JSON value");
+    let list: Vec<&str> = v["ax_features"]
+        .as_array()
+        .expect("ax_features array")
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert_eq!(list, cu_atspi::features());
+}
+
+#[test]
+fn ax_find_help_lists_shared_flags() {
+    let out = run(&["ax-find", "--help"]);
+    assert_eq!(out.status.code(), Some(0));
+    let help = stdout(&out);
+    for flag in [
+        "--window ",
+        "--window-ref",
+        "--deadline-ms",
+        "--root-ref",
+        "--scope",
+        "--skeleton",
+    ] {
+        assert!(help.contains(flag), "{flag} missing from:\n{help}");
+    }
+}
+
+#[test]
 fn ax_action_rejects_text_in_argv() {
     for extra in [["--text", "secret"], ["--text-stdin", "x"]] {
         let out = run(&[

@@ -69,40 +69,16 @@ fn run() -> Result<ExitCode> {
         Command::AxRestore { holder_pid } => {
             print_json(&ax::restore(holder_pid)?)?;
         }
-        Command::AxFind {
-            window,
-            role,
-            title_contains,
-            all,
-            include_hidden,
-            max_nodes,
-            max_depth,
-        } => {
+        Command::AxFind { window, ax } => {
             let conn = Conn::connect()?;
             let windows = wm::windows(&conn)?;
-            let args = ax::FindArgs {
-                window,
-                role,
-                title_contains,
-                all,
-                include_hidden,
-                max_nodes,
-                max_depth,
-            };
-            print_json(&ax::find(&conn, &windows, &args)?)?;
+            print_json(&ax::find(&conn, &windows, &window, &ax)?)?;
         }
-        Command::AxAction {
-            scope,
-            element_ref,
-            action,
-        } => {
-            print_json(&ax::action(
-                &scope,
-                &element_ref,
-                action,
-                std::io::stdin().lock(),
-            )?)?;
+        Command::AxAction { ax } => {
+            print_json(&ax::action(&ax, std::io::stdin().lock())?)?;
         }
+        // No X11, D-Bus or session: the list is compiled into the crate.
+        Command::AxFeatures => println!("{}", cu_atspi::features_json()),
         Command::Screens => {
             let conn = Conn::connect()?;
             let monitors = conn.monitors()?;

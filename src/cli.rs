@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
 /// Mask mode for `screenshot` / `zoom`: paint everything except the kept
 /// windows with a solid fill. Without either flag the capture is unmasked.
@@ -34,14 +34,6 @@ fn parse_window_arg(value: &str) -> Result<u32, String> {
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
-}
-
-/// Action for `ax-action`. `set-text` reads the text from stdin, never argv.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AxActionKind {
-    Click,
-    Focus,
-    SetText,
 }
 
 #[derive(Debug, Subcommand)]
@@ -183,26 +175,139 @@ pub enum Command {
     AxFind {
         #[arg(long)]
         window: String,
-        #[arg(long)]
-        role: Option<String>,
-        #[arg(long)]
-        title_contains: Option<String>,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        include_hidden: bool,
-        #[arg(long)]
-        max_nodes: Option<usize>,
-        #[arg(long)]
-        max_depth: Option<u32>,
+        #[command(flatten)]
+        ax: cu_atspi::cli::AxFindFlags,
     },
     /// Act on an element returned by `ax-find`. `set-text` reads stdin.
     AxAction {
-        #[arg(long)]
-        scope: String,
-        #[arg(long = "ref")]
-        element_ref: String,
-        #[arg(long, value_enum)]
-        action: AxActionKind,
+        #[command(flatten)]
+        ax: cu_atspi::cli::AxActionFlags,
     },
+    /// List the accessibility features of this build as JSON. Needs no X
+    /// server, D-Bus or session.
+    AxFeatures,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cu_atspi::ActionKind;
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        let mut argv = vec!["x11-bridge"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).map(|c| c.command)
+    }
+
+    #[test]
+    fn ax_find_old_flags_parse() {
+        let Command::AxFind { window, ax } = parse(&[
+            "ax-find",
+            "--window",
+            "0x1",
+            "--role",
+            "AXButton",
+            "--title-contains",
+            "Save",
+            "--all",
+            "--include-hidden",
+            "--max-nodes",
+            "10",
+            "--max-depth",
+            "4",
+        ])
+        .unwrap() else {
+            panic!("not ax-find")
+        };
+        assert_eq!(window, "0x1");
+        assert_eq!(ax.role.as_deref(), Some("AXButton"));
+        assert_eq!(ax.title_contains.as_deref(), Some("Save"));
+        assert!(ax.all && ax.include_hidden);
+        assert_eq!((ax.max_nodes, ax.max_depth), (Some(10), Some(4)));
+    }
+
+    #[test]
+    fn ax_find_new_flags_parse() {
+        let Command::AxFind { ax, .. } = parse(&[
+            "ax-find",
+            "--window",
+            "0x1",
+            "--window-ref",
+            "w",
+            "--deadline-ms",
+            "500",
+            "--root-ref",
+            "r",
+            "--scope",
+            "s",
+        ])
+        .unwrap() else {
+            panic!("not ax-find")
+        };
+        assert_eq!(ax.deadline_ms, Some(500));
+        assert_eq!(ax.root_ref.as_deref(), Some("r"));
+        assert_eq!(ax.scope.as_deref(), Some("s"));
+        let Command::AxFind { ax, .. } =
+            parse(&["ax-find", "--window", "0x1", "--skeleton"]).unwrap()
+        else {
+            panic!("not ax-find")
+        };
+        assert!(ax.skeleton);
+    }
+
+    #[test]
+    fn ax_find_root_ref_needs_scope() {
+        let err = parse(&["ax-find", "--window", "0x1", "--root-ref", "r"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn ax_find_skeleton_conflicts_with_filters() {
+        let err = parse(&[
+            "ax-find",
+            "--window",
+            "0x1",
+            "--skeleton",
+            "--role",
+            "button",
+        ])
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn ax_action_kinds_parse() {
+        for (name, kind) in [
+            ("click", ActionKind::Click),
+            ("set-text", ActionKind::SetText),
+            ("ensure-checked", ActionKind::EnsureChecked),
+            ("scroll-to", ActionKind::ScrollTo),
+            ("set-value", ActionKind::SetValue),
+        ] {
+            let Command::AxAction { ax } =
+                parse(&["ax-action", "--scope", "s", "--ref", "r", "--action", name]).unwrap()
+            else {
+                panic!("not ax-action")
+            };
+            assert_eq!(ax.action, kind, "{name}");
+        }
+        assert!(
+            parse(&[
+                "ax-action",
+                "--scope",
+                "s",
+                "--ref",
+                "r",
+                "--action",
+                "bogus"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ax_features_takes_no_flags() {
+        assert!(matches!(parse(&["ax-features"]), Ok(Command::AxFeatures)));
+        assert!(parse(&["ax-features", "--all"]).is_err());
+    }
 }

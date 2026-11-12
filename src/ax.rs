@@ -5,13 +5,11 @@
 //! paths. `ax-find` only reads the bridge's own window enumeration (the same
 //! data `windows` prints) to fill the crate's `WindowHint`.
 
-use std::io::Read;
-
-use anyhow::{Context, Result, bail};
-use cu_atspi::{Action, AtspiDoctor, FindRequest, Outcome, Rect, WindowHint};
+use anyhow::Result;
+use cu_atspi::cli::{AxActionFlags, AxFindFlags};
+use cu_atspi::{AtspiDoctor, Outcome, Rect, WindowHint};
 use serde::Serialize;
 
-use crate::cli::AxActionKind;
 use crate::output::WindowInfo;
 
 /// Parse a window id (`0x3a00007` or decimal) to a number for comparison.
@@ -82,32 +80,6 @@ pub fn window_hint(window: &WindowInfo, extents: Option<[i32; 4]>) -> WindowHint
     }
 }
 
-pub struct FindArgs {
-    pub window: String,
-    pub role: Option<String>,
-    pub title_contains: Option<String>,
-    pub all: bool,
-    pub include_hidden: bool,
-    pub max_nodes: Option<usize>,
-    pub max_depth: Option<u32>,
-}
-
-pub fn find_request(
-    window: &WindowInfo,
-    extents: Option<[i32; 4]>,
-    args: &FindArgs,
-) -> FindRequest {
-    FindRequest {
-        window: window_hint(window, extents),
-        role: args.role.clone(),
-        title_contains: args.title_contains.clone(),
-        all: args.all,
-        include_hidden: args.include_hidden,
-        max_nodes: args.max_nodes,
-        max_depth: args.max_depth,
-    }
-}
-
 /// The `unavailable` result for a window id the bridge does not know.
 pub fn window_not_found(id: &str) -> serde_json::Value {
     serde_json::json!({
@@ -126,13 +98,17 @@ pub enum FindOut {
     Local(serde_json::Value),
 }
 
-pub fn find(conn: &crate::conn::Conn, windows: &[WindowInfo], args: &FindArgs) -> Result<FindOut> {
-    let Some(window) = windows.iter().find(|w| same_window_id(&w.id, &args.window)) else {
-        return Ok(FindOut::Local(window_not_found(&args.window)));
+pub fn find(
+    conn: &crate::conn::Conn,
+    windows: &[WindowInfo],
+    window_id: &str,
+    flags: &AxFindFlags,
+) -> Result<FindOut> {
+    let Some(window) = windows.iter().find(|w| same_window_id(&w.id, window_id)) else {
+        return Ok(FindOut::Local(window_not_found(window_id)));
     };
-    let extents = frame_extents(conn, &window.id);
-    let req = find_request(window, extents, args);
-    let out = cu_atspi::blocking::find(&req).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hint = window_hint(window, frame_extents(conn, &window.id));
+    let out = cu_atspi::blocking::find(&flags.request(hint)).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(FindOut::Crate(Box::new(out)))
 }
 
@@ -146,46 +122,28 @@ pub fn restore(holder_pid: u32) -> Result<Outcome<cu_atspi::RestoreResult>> {
 
 /// Caller error (bad input): the bridge exits 2 instead of 1.
 #[derive(Debug)]
-pub struct UsageError(pub &'static str);
+pub struct UsageError(pub String);
 
 impl std::fmt::Display for UsageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(&self.0)
     }
 }
 
 impl std::error::Error for UsageError {}
 
-/// Read all of `reader` as UTF-8, no trimming. Text never comes from argv
-/// (visible in `ps`) and is never logged.
-pub fn read_text(mut reader: impl Read) -> Result<String> {
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .context("failed to read text from stdin")?;
-    String::from_utf8(bytes)
-        .map_err(|_| anyhow::Error::new(UsageError("stdin text is not valid UTF-8")))
-}
-
-pub fn build_action(kind: AxActionKind, stdin: impl Read) -> Result<Action> {
-    Ok(match kind {
-        AxActionKind::Click => Action::Click,
-        AxActionKind::Focus => Action::Focus,
-        AxActionKind::SetText => Action::SetText(read_text(stdin)?),
-    })
-}
-
 pub fn action(
-    scope: &str,
-    element_ref: &str,
-    kind: AxActionKind,
-    stdin: impl Read,
+    flags: &AxActionFlags,
+    stdin: impl std::io::Read,
 ) -> Result<Outcome<cu_atspi::ActionResult>> {
-    if scope.is_empty() || element_ref.is_empty() {
-        bail!("--scope and --ref must not be empty");
-    }
-    let action = build_action(kind, stdin)?;
-    cu_atspi::blocking::action(element_ref, &action, scope).map_err(|e| anyhow::anyhow!("{e}"))
+    let request = flags.request(true, stdin).map_err(|e| {
+        if e.is_usage() {
+            anyhow::Error::new(UsageError(e.to_string()))
+        } else {
+            anyhow::anyhow!("{e}")
+        }
+    })?;
+    cu_atspi::blocking::act(&request).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Longest `doctor` waits for the AT-SPI probe (the launcher kills doctor at 5 s).
@@ -202,6 +160,10 @@ pub fn doctor_with(
     });
     rx.recv_timeout(limit).unwrap_or_else(|_| AtspiDoctor {
         error: Some("accessibility probe timed out".into()),
+        features: cu_atspi::features()
+            .iter()
+            .map(|f| (*f).to_owned())
+            .collect(),
         ..Default::default()
     })
 }
@@ -300,16 +262,6 @@ mod tests {
 
     #[test]
     fn unknown_window_is_unavailable_exit_zero_shape() {
-        let args = FindArgs {
-            window: "0x1".into(),
-            role: None,
-            title_contains: None,
-            all: false,
-            include_hidden: false,
-            max_nodes: None,
-            max_depth: None,
-        };
-        let _ = &args;
         let out = FindOut::Local(window_not_found("0x1"));
         let v = serde_json::to_value(&out).unwrap();
         assert_eq!(v["unavailable"], "window_not_found");
@@ -317,40 +269,27 @@ mod tests {
     }
 
     #[test]
-    fn find_request_carries_flags() {
-        let args = FindArgs {
-            window: "0x3a00007".into(),
-            role: Some("AXButton".into()),
-            title_contains: Some("Save".into()),
-            all: true,
-            include_hidden: true,
-            max_nodes: Some(10),
-            max_depth: Some(4),
+    fn doctor_timeout_still_lists_features() {
+        let d = doctor_with(
+            || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                AtspiDoctor::default()
+            },
+            std::time::Duration::from_millis(50),
+        );
+        assert_eq!(d.features.len(), cu_atspi::features().len());
+        assert!(!d.features.is_empty());
+    }
+
+    #[test]
+    fn set_text_invalid_utf8_is_a_usage_error() {
+        let flags = AxActionFlags {
+            scope: "s".into(),
+            element_ref: "r".into(),
+            action: cu_atspi::ActionKind::SetText,
+            expect_json: false,
         };
-        let r = find_request(&window(), None, &args);
-        assert_eq!(r.role.as_deref(), Some("AXButton"));
-        assert_eq!(r.title_contains.as_deref(), Some("Save"));
-        assert!(r.all && r.include_hidden);
-        assert_eq!((r.max_nodes, r.max_depth), (Some(10), Some(4)));
-    }
-
-    #[test]
-    fn set_text_reads_all_stdin_untrimmed() {
-        let a = build_action(AxActionKind::SetText, "  héllo\n".as_bytes()).unwrap();
-        assert_eq!(a, Action::SetText("  héllo\n".into()));
-        let e = build_action(AxActionKind::SetText, &[0xff, 0xfe][..]).unwrap_err();
+        let e = action(&flags, &[0xff, 0xfe][..]).unwrap_err();
         assert!(e.downcast_ref::<UsageError>().is_some());
-    }
-
-    #[test]
-    fn click_and_focus_ignore_stdin() {
-        assert_eq!(
-            build_action(AxActionKind::Click, &b"x"[..]).unwrap(),
-            Action::Click
-        );
-        assert_eq!(
-            build_action(AxActionKind::Focus, &b"x"[..]).unwrap(),
-            Action::Focus
-        );
     }
 }
