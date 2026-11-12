@@ -22,6 +22,57 @@ use crate::conn::Conn;
 
 /// Real-modifier bit for Shift.
 pub const SHIFT_MASK: u8 = 0x01;
+/// Real-modifier bit for Lock (Caps Lock).
+pub const LOCK_MASK: u8 = 0x02;
+
+/// The character a keysym stands for.
+pub fn keysym_char(keysym: Keysym) -> Option<char> {
+    if keysym == 0 {
+        return None;
+    }
+    xkeysym::Keysym::new(keysym).key_char()
+}
+
+fn keysym_of(ch: char) -> Keysym {
+    xkeysym::Keysym::from_char(ch).raw()
+}
+
+/// The capital of a keysym's character (itself if it has none, or if the
+/// capital is not a single character, like `ß` -> `SS`).
+pub fn keysym_upper(keysym: Keysym) -> Keysym {
+    case_map(keysym, |c| c.to_uppercase().collect())
+}
+
+/// The small letter of a keysym's character (itself if it has none).
+pub fn keysym_lower(keysym: Keysym) -> Keysym {
+    case_map(keysym, |c| c.to_lowercase().collect())
+}
+
+fn case_map(keysym: Keysym, map: impl Fn(char) -> Vec<char>) -> Keysym {
+    let Some(ch) = keysym_char(keysym) else {
+        return keysym;
+    };
+    // `ß` has the single capital `ẞ` in X (Xlib upper-cases it so under Caps
+    // Lock), not the two letters `SS` of Unicode's full mapping.
+    if ch == 'ß' {
+        let up = map(ch);
+        if up.len() > 1 {
+            return keysym_of('ẞ');
+        }
+    }
+    match map(ch).as_slice() {
+        [single] if *single != ch => {
+            let mapped = keysym_of(*single);
+            if mapped == 0 { keysym } else { mapped }
+        }
+        _ => keysym,
+    }
+}
+
+/// Two keysyms that stand for the same character (`U00E9` and `eacute`).
+pub fn same_symbol(a: Keysym, b: Keysym) -> bool {
+    a == b || (a != 0 && b != 0 && keysym_char(a).is_some() && keysym_char(a) == keysym_char(b))
+}
 
 /// One key type: the modifiers it looks at and which level each combination
 /// selects (combinations not listed select level 1, index 0).
@@ -30,6 +81,10 @@ pub struct KeyType {
     pub mods_mask: u8,
     /// `(mods, level index)` for the active map entries.
     pub entries: Vec<(u8, u8)>,
+    /// `(entry mods, preserved mods)`: modifiers an entry leaves unconsumed
+    /// (FOUR_LEVEL_SEMIALPHABETIC keeps Lock at AltGr levels, so clients
+    /// upper-case `µ` under Caps Lock).
+    pub preserve: Vec<(u8, u8)>,
 }
 
 impl KeyType {
@@ -40,6 +95,17 @@ impl KeyType {
             .iter()
             .find(|&&(m, _)| m == masked)
             .map_or(0, |&(_, level)| level)
+    }
+
+    /// The modifiers a key of this type consumes when `mods` are down.
+    pub fn consumed(&self, mods: u8) -> u8 {
+        let masked = mods & self.mods_mask;
+        let kept = self
+            .preserve
+            .iter()
+            .find(|&&(m, _)| m == masked)
+            .map_or(0, |&(_, p)| p);
+        self.mods_mask & !kept
     }
 }
 
@@ -58,7 +124,7 @@ pub struct Key {
 }
 
 impl Key {
-    fn num_groups(&self) -> u8 {
+    pub fn num_groups(&self) -> u8 {
         self.group_info & 0x0f
     }
 
@@ -175,6 +241,16 @@ impl Layout {
                     .filter(|e| e.active)
                     .map(|e| (u16::from(e.mods_mask) as u8, e.level))
                     .collect(),
+                preserve: if t.has_preserve {
+                    t.map
+                        .iter()
+                        .zip(&t.preserve)
+                        .filter(|(e, _)| e.active)
+                        .map(|(e, p)| (u16::from(e.mods_mask) as u8, u16::from(p.mask) as u8))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         let mut keys: Vec<Key> = reply
@@ -243,7 +319,11 @@ impl Layout {
                 *slot |= 1 << (index / per_mod);
             }
         }
-        Ok(Self::from_core_rows(min, &reply.keysyms, per, &modmap))
+        let mut layout = Self::from_core_rows(min, &reply.keysyms, per, &modmap);
+        // Without XKB the core pointer state carries Caps Lock.
+        let pointer = c.query_pointer(conn.root)?.reply()?;
+        layout.locked_mods = (u16::from(pointer.mask) as u8) & LOCK_MASK;
+        Ok(layout)
     }
 
     /// Build a group-1, two-level layout from core keyboard-mapping rows.
@@ -267,6 +347,7 @@ impl Layout {
             types: vec![KeyType {
                 mods_mask: SHIFT_MASK,
                 entries: vec![(SHIFT_MASK, 1)],
+                preserve: vec![],
             }],
             group: 0,
             locked_mods: 0,
@@ -331,50 +412,129 @@ impl Layout {
             .unwrap_or(0)
     }
 
+    /// What a client reads from `keycode` with `mods` in `group`: the level's
+    /// keysym, upper-cased when Lock is on and the key type does not use Lock
+    /// (the XKB "Lock not consumed" rule that xkbcommon and Xlib apply).
+    pub fn produced(&self, keycode: Keycode, mods: u8, group: u8) -> Keysym {
+        let keysym = self.keysym_at(keycode, mods, group);
+        if mods & LOCK_MASK == 0 || keysym == 0 {
+            return keysym;
+        }
+        let consumes_lock = keycode
+            .checked_sub(self.min_keycode)
+            .and_then(|i| self.keys.get(usize::from(i)))
+            .and_then(|key| {
+                let g = key.effective_group(group)?;
+                let index = key.types.get(usize::from(g)).copied().unwrap_or(0);
+                self.types.get(usize::from(index))
+            })
+            .is_some_and(|t| t.consumed(mods) & LOCK_MASK != 0);
+        if consumes_lock {
+            keysym
+        } else {
+            keysym_upper(keysym)
+        }
+    }
+
+    /// The key type of `keycode` in the active group.
+    pub fn key_type(&self, keycode: Keycode) -> Option<&KeyType> {
+        let key = self
+            .keys
+            .get(usize::from(keycode.checked_sub(self.min_keycode)?))?;
+        let g = key.effective_group(self.group)?;
+        self.types.get(usize::from(
+            key.types.get(usize::from(g)).copied().unwrap_or(0),
+        ))
+    }
+
+    /// Index of a two-level type whose level 2 is chosen by Shift or by Lock
+    /// (ALPHABETIC in every standard keymap).
+    pub fn alphabetic_type(&self) -> Option<u8> {
+        self.types
+            .iter()
+            .position(|t| {
+                t.mods_mask == SHIFT_MASK | LOCK_MASK
+                    && t.entries.contains(&(SHIFT_MASK, 1))
+                    && t.entries.contains(&(LOCK_MASK, 1))
+                    && !t.entries.contains(&(SHIFT_MASK | LOCK_MASK, 1))
+            })
+            .map(|i| i as u8)
+    }
+
     /// Find a key and level modifiers that produce `keysym` in the active
-    /// group, preferring no modifier, then Shift, then (with `allow_level3`)
-    /// AltGr and AltGr+Shift; the lowest keycode wins within one choice.
-    /// Locked modifiers (Caps Lock) are taken into account: this is what
-    /// `type` needs to produce the character.
+    /// group with the locked modifiers (Caps Lock) as they are: what `type`
+    /// needs to produce the character. Keys are tried in keycode order, each
+    /// at levels 1 and 2 (Shift), so the main block wins over the keypad;
+    /// AltGr levels (with `allow_level3`) only when no key has it at levels
+    /// 1-2.
     pub fn find(&self, keysym: Keysym, allow_level3: bool) -> Option<Stroke> {
-        self.find_with(keysym, allow_level3, self.locked_mods)
-    }
-
-    /// The key of a shortcut: levels 1-2 only and locked modifiers ignored,
-    /// so `ctrl+a` stays Ctrl+A with Caps Lock on (a shortcut is matched by
-    /// its key, not by the character).
-    pub fn find_shortcut(&self, keysym: Keysym) -> Option<Stroke> {
-        self.find_with(keysym, false, 0)
-    }
-
-    fn find_with(&self, keysym: Keysym, allow_level3: bool, locked: u8) -> Option<Stroke> {
         if keysym == 0 {
             return None;
         }
         let shift = self.shift.map(|m| m.mask);
-        let level3 = if allow_level3 {
-            self.level3.map(|m| m.mask)
-        } else {
-            None
-        };
-        let mut combos: Vec<(bool, bool, u8)> = vec![(false, false, 0)];
+        let level3 = self.level3.map(|m| m.mask).filter(|_| allow_level3);
+        let mut passes: Vec<Vec<(bool, bool, u8)>> = vec![vec![(false, false, 0)]];
         if let Some(s) = shift {
-            combos.push((true, false, s));
+            passes[0].push((true, false, s));
         }
         if let Some(l3) = level3 {
-            combos.push((false, true, l3));
+            let mut altgr = vec![(false, true, l3)];
             if let Some(s) = shift {
-                combos.push((true, true, s | l3));
+                altgr.push((true, true, s | l3));
             }
+            passes.push(altgr);
         }
-        for (want_shift, want_level3, mods) in combos {
+        for combos in passes {
             for index in 0..self.keys.len() {
                 let keycode = self.min_keycode + index as u8;
-                if self.keysym_at(keycode, mods | locked, self.group) == keysym {
+                for &(want_shift, want_level3, mods) in &combos {
+                    let got = self.produced(keycode, mods | self.locked_mods, self.group);
+                    if same_symbol(got, keysym) {
+                        return Some(Stroke {
+                            keycode,
+                            shift: want_shift,
+                            level3: want_level3,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The physical key of a shortcut: the key that carries `keysym` at level
+    /// 1 or 2 in the active group, else in another group (Ctrl+C on an active
+    /// Russian layout presses the key that is C in the Latin layout, as a
+    /// user does). Locked modifiers are ignored, so `ctrl+a` stays Ctrl+A with
+    /// Caps Lock on; AltGr is never used.
+    pub fn find_shortcut(&self, keysym: Keysym) -> Option<Stroke> {
+        if keysym == 0 {
+            return None;
+        }
+        let mut groups = vec![self.group];
+        groups.extend((0..4u8).filter(|&g| g != self.group));
+        let shift = self.shift.map(|m| m.mask);
+        for group in groups {
+            for index in 0..self.keys.len() {
+                let keycode = self.min_keycode + index as u8;
+                let key = &self.keys[index];
+                if group != self.group && group >= key.num_groups() {
+                    continue;
+                }
+                if same_symbol(self.keysym_at(keycode, 0, group), keysym) {
                     return Some(Stroke {
                         keycode,
-                        shift: want_shift,
-                        level3: want_level3,
+                        shift: false,
+                        level3: false,
+                    });
+                }
+                if let Some(s) = shift
+                    && same_symbol(self.keysym_at(keycode, s, group), keysym)
+                {
+                    return Some(Stroke {
+                        keycode,
+                        shift: true,
+                        level3: false,
                     });
                 }
             }
@@ -400,21 +560,25 @@ mod tests {
             KeyType {
                 mods_mask: 0,
                 entries: vec![],
+                preserve: vec![],
             },
             // 1: FOUR_LEVEL
             KeyType {
                 mods_mask: SHIFT_MASK | MOD5,
                 entries: vec![(SHIFT_MASK, 1), (MOD5, 2), (SHIFT_MASK | MOD5, 3)],
+                preserve: vec![],
             },
             // 2: ALPHABETIC (Lock acts like Shift)
             KeyType {
                 mods_mask: SHIFT_MASK | LOCK,
                 entries: vec![(SHIFT_MASK, 1), (LOCK, 1)],
+                preserve: vec![],
             },
             // 3: TWO_LEVEL
             KeyType {
                 mods_mask: SHIFT_MASK,
                 entries: vec![(SHIFT_MASK, 1)],
+                preserve: vec![],
             },
         ];
         let keys = vec![
@@ -556,6 +720,99 @@ mod tests {
                 level3: false
             })
         );
+    }
+
+    #[test]
+    fn caps_lock_upper_cases_keys_whose_type_ignores_lock() {
+        // Keycode 15: a TWO_LEVEL key carrying `é É` (what the server makes of
+        // a Unicode pair). Caps Lock is not consumed, so clients upper-case:
+        // `é` cannot be typed, `É` comes with or without Shift.
+        let mut l = layout(0, LOCK);
+        l.keys.push(Key {
+            group_info: 1,
+            types: vec![3, 0, 0, 0],
+            width: 2,
+            syms: vec![key::eacute, key::Eacute],
+        });
+        assert_eq!(l.produced(15, LOCK, 0), key::Eacute);
+        assert_eq!(l.produced(15, LOCK | SHIFT_MASK, 0), key::Eacute);
+        assert_eq!(l.find(key::eacute, true), None);
+        assert_eq!(l.find(key::Eacute, true).map(|s| s.keycode), Some(15));
+        // The same key as ALPHABETIC (type 2) consumes Lock.
+        l.keys[5].types[0] = 2;
+        assert_eq!(
+            l.find(key::eacute, true),
+            Some(Stroke {
+                keycode: 15,
+                shift: true,
+                level3: false
+            })
+        );
+        assert_eq!(l.alphabetic_type(), Some(2));
+    }
+
+    #[test]
+    fn a_preserved_lock_is_not_consumed() {
+        // FOUR_LEVEL_SEMIALPHABETIC-like: Lock picks level 2 at levels 1-2,
+        // but at AltGr levels it is preserved, so clients upper-case `µ`.
+        let t = KeyType {
+            mods_mask: SHIFT_MASK | LOCK | MOD5,
+            entries: vec![(SHIFT_MASK, 1), (LOCK, 1), (MOD5, 2), (MOD5 | LOCK, 2)],
+            preserve: vec![(MOD5 | LOCK, LOCK)],
+        };
+        assert_eq!(t.consumed(LOCK) & LOCK, LOCK);
+        assert_eq!(t.consumed(LOCK | MOD5) & LOCK, 0);
+        let mut l = layout(0, LOCK);
+        l.types.push(t);
+        l.keys.push(Key {
+            group_info: 1,
+            types: vec![4, 0, 0, 0],
+            width: 4,
+            syms: vec![key::m, key::M, key::mu, 0],
+        });
+        assert_eq!(l.produced(15, LOCK | MOD5, 0), key::Greek_MU);
+        assert_eq!(l.find(key::mu, true), None);
+    }
+
+    #[test]
+    fn keys_are_tried_in_keycode_order_before_altgr() {
+        // `Q` (Shift on keycode 10) is found before an unshifted `Q` on a
+        // higher keycode, like `(` on the main block before the keypad's.
+        let mut l = layout(0, 0);
+        l.keys.push(Key {
+            group_info: 1,
+            types: vec![0, 0, 0, 0],
+            width: 1,
+            syms: vec![key::Q],
+        });
+        assert_eq!(
+            l.find(key::Q, true),
+            Some(Stroke {
+                keycode: 10,
+                shift: true,
+                level3: false
+            })
+        );
+    }
+
+    #[test]
+    fn shortcut_falls_back_to_another_group() {
+        // Group 2 active (`z Z` on keycode 11): `y` is no key of it, but the
+        // key that is `y` in group 1 is pressed (Ctrl+Y on a Russian layout
+        // presses the Latin key, as a user does).
+        let l = layout(1, 0);
+        assert_eq!(l.find(key::y, true), None);
+        assert_eq!(l.find_shortcut(key::y).map(|s| s.keycode), Some(11));
+        // A character of the active group still wins.
+        assert_eq!(l.find_shortcut(key::z).map(|s| s.keycode), Some(11));
+    }
+
+    #[test]
+    fn unicode_and_legacy_keysyms_are_the_same_symbol() {
+        assert!(same_symbol(key::eacute, 0x10000e9));
+        assert!(!same_symbol(key::eacute, key::Eacute));
+        assert_eq!(keysym_upper(key::ssharp), 0x1001e9e);
+        assert_eq!(keysym_upper(key::_1), key::_1);
     }
 
     #[test]

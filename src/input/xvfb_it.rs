@@ -134,7 +134,9 @@ fn type_text_roundtrips_ascii_and_accent() {
     // inherently racy against the per-char restore, so we assert the observable
     // invariant instead: a separate keycode carried the accent.)
     let text = "Ab1é";
-    keyboard::type_text(&conn, text, 20).expect("type text");
+    // The bridge drains its own connection's events: type on another one.
+    let typer = Conn::connect().expect("typer connect");
+    keyboard::type_text(&typer, text, 20).expect("type text");
     let events = drain_events(&conn, Instant::now() + Duration::from_millis(400));
 
     let map = KeyboardMap::fetch(&conn).unwrap();
@@ -188,7 +190,8 @@ fn key_sequence_delivers_base_key() {
     let win = make_focused_window(&conn, EventMask::KEY_PRESS | EventMask::KEY_RELEASE);
 
     // ctrl+a: the base 'a' KeyPress must arrive while Control is held.
-    keyboard::key_sequence(&conn, "ctrl+a", None).expect("key sequence");
+    let typer = Conn::connect().expect("typer connect");
+    keyboard::key_sequence(&typer, "ctrl+a", None).expect("key sequence");
     let events = drain_events(&conn, Instant::now() + Duration::from_millis(300));
 
     let map = KeyboardMap::fetch(&conn).unwrap();
@@ -423,7 +426,7 @@ fn type_text_german_layout_reaches_a_lazy_client() {
         let got = lazy_client_text(
             text,
             delay,
-            Duration::from_millis(40),
+            Duration::from_millis(20),
             Duration::from_secs(15),
         );
         assert_eq!(got, text, "de layout, delay {delay} ms");
@@ -442,7 +445,7 @@ fn type_text_second_group_types_the_active_layout() {
     let holder = Conn::connect().expect("connect to Xvfb");
     load_layout(&holder, "us,de", 1);
     let text = "yzYZ @{}\\ äöü ^`'";
-    let got = lazy_client_text(text, 12, Duration::from_millis(40), Duration::from_secs(10));
+    let got = lazy_client_text(text, 12, Duration::from_millis(20), Duration::from_secs(10));
     load_layout(&holder, "us", 0);
     assert_eq!(got, text, "us,de with de active");
 }
@@ -460,7 +463,7 @@ fn type_text_pages_many_distinct_characters() {
         .filter(|c| !c.is_control())
         .take(spares * 2 + 5)
         .collect();
-    let got = lazy_client_text(&text, 0, Duration::from_millis(40), Duration::from_secs(15));
+    let got = lazy_client_text(&text, 0, Duration::from_millis(20), Duration::from_secs(15));
     load_layout(&holder, "us", 0);
     assert_eq!(got, text);
 }

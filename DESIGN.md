@@ -51,9 +51,9 @@ the kwin bridge emits them and how the JS reads them).
 | `pointer-scroll --x --y [--dx] [--dy]` | `{action, x, y}` | body ignored |
 | `pointer-drag --from-x --from-y --to-x --to-y` | `{action, fromX, fromY, toX, toY}` | body ignored |
 | `left-mouse-down` / `left-mouse-up` | `{action, button, isHeld}` | body ignored |
-| `key-sequence --keys <spec> [--repeat N]` | `{action, keys, repeat?}` | body ignored |
-| `type --text <t> [--delay-ms N]` | `{action, text, charCount}` | body ignored |
-| `hold-key --key <k>... --duration-ms N` | `{action, keys, durationMs}` | body ignored |
+| `key-sequence --keys <spec> [--repeat N]` | `{action, keys, repeat?}`; `interrupted: true` with exit 1 when a signal stopped it | body ignored |
+| `type --text <t> [--delay-ms N]` | `{action, text, charCount}`; when stopped early also `interrupted: true` and `reason` (`"signal"` or `"keymapChanged"`), on stdout with exit 1 | body ignored |
+| `hold-key --key <k>... --duration-ms N` | `{action, keys, durationMs}`; `interrupted: true` with exit 1 when a signal ended the hold early | body ignored |
 | `session-start [--foreground]` | `{ok:true, session:"noop"}` | `execBridge` tolerates any/empty output |
 | `session-end` | `{ok:true, ended:true}` | same |
 | `abort-watch` | long-running, JSON lines (see [Escape abort](#escape-abort-abort-watch)) | `js/cu_esc_watch.js` |
@@ -235,31 +235,50 @@ The authoritative starting table lives in `src/input/keymap.rs`
 steps (`src/input/layout.rs`, `src/input/remap.rs`):
 
 1. **On the layout.** The XKB map and state (`XkbGetMap`, `XkbGetState`) say,
-   for the effective group, which key and level produce a keysym. A level is
-   chosen by the key type's modifier map with the locked modifiers (Caps Lock,
-   Num Lock) included, and is selected by holding the layout's own Shift key
-   and, for `type` only, its ISO_Level3_Shift (AltGr) key - both found as keys
-   whose level-1 keysym is the modifier and which the modifier map binds.
-   Preference: no modifier, Shift, AltGr, AltGr+Shift; lowest keycode within
-   one choice. `key-sequence` and `hold-key` never use AltGr, so a shortcut
-   never gains a modifier. Dead keys are never pressed: `^` on a German layout
-   is `dead_circumflex`, a different keysym, so it takes step 2. Without XKB
-   the core mapping is used (group 1, levels 1-2).
+   for the effective group, which key and level produce a keysym. The level
+   follows the key type's modifier map with the locked modifiers (Caps Lock,
+   Num Lock) included, and the bridge models what clients do with Caps Lock:
+   when the key type does not use Lock, they upper-case the keysym (the XKB
+   "Lock not consumed" rule of xkbcommon and Xlib; `ß` becomes `ẞ` as in
+   Xlib). Levels are selected with the layout's own Shift key and, for `type`
+   only, its ISO_Level3_Shift (AltGr) key - keys whose level-1 keysym is the
+   modifier and which the modifier map binds. Keys are tried in keycode order,
+   each at levels 1 and 2, so the main block wins over the keypad (`(` is
+   Shift+9, not the keypad's `KPLeftParenthesis`); AltGr levels come only when
+   no key has the keysym at levels 1-2. Keysyms are compared as characters
+   (`U00E9` matches `eacute`). Dead keys are never pressed: `^` on a German
+   layout is `dead_circumflex`, a different keysym, so it takes step 2.
+   Without XKB the core mapping is used (group 1, levels 1-2, Caps Lock from
+   the core pointer state).
+   `key-sequence` and `hold-key` press the physical key instead: the key with
+   the keysym at level 1 or 2 in the active group, else in another group
+   (Ctrl+C on an active Russian layout presses the Latin layout's C key, as a
+   user does; on `us,de` with German active, `ctrl+z` is the German Z key).
+   They never add AltGr and ignore Caps Lock, so `ctrl+a` stays Ctrl+A.
 2. **Spare keycodes.** Characters no key of the active group produces are
    bound to keycodes with no keysym in any column (no physical key of the
-   layout sends them; Xvfb's German layout has 15: 8, 97, 103, ...; with none
-   the last keycode is borrowed). A text is split into pages of at most that
-   many distinct characters; a page's characters are bound 50 ms
-   (`BIND_WAIT_MS`) before its first key, and the keycodes change again only
-   200 ms (`SETTLE_MS`) after the last
-   key typed with them - for the next page or for the restore at the end. When
-   keys go out faster than 4 ms each (`--delay-ms` below 4), the change also
-   waits until a client handling one key per 4 ms (`CLIENT_KEY_MS`) could
-   have read every key sent since the page was bound: a busy client's backlog
-   otherwise still holds keys of the page (seen in GTK at `--delay-ms 0` on a
-   loaded host: 3 of 15 long texts lost characters at page changes).
+   layout sends them; Xvfb's layouts have 15: 8, 97, 103, ...; with none the
+   last keycode is borrowed). A character with a case pair takes a keycode as
+   `[small, capital]`; two characters without case share one at levels 1 and
+   2. The server derives a key type from such a row only for legacy keysyms
+   (`eacute Eacute`, Cyrillic, Greek get ALPHABETIC, which uses Caps Lock);
+   for Unicode keysyms (`ạ Ạ`, Armenian) it picks TWO_LEVEL, and under Caps
+   Lock clients would upper-case both levels. The bridge then sets ALPHABETIC
+   explicitly (`XkbSetMap`) and releases the explicit type at the restore.
+   After binding, the layout is read again and the bound characters are
+   resolved like layout keys (Shift exactly when Caps Lock and the wanted case
+   differ). A text is split into pages that fit the spare keycodes; keycodes
+   are reused least recently changed first. A page is bound 50 ms
+   (`BIND_WAIT_MS`) before its first key, and its keycodes change again only
+   200 ms (`SETTLE_MS`) after the last key typed with them - for the next page
+   or for the restore at the end. When keys go out faster than 4 ms each
+   (`--delay-ms` below 4), a change also waits until a client handling one key
+   per 4 ms (`CLIENT_KEY_MS`) could have read the keys sent since the page was
+   bound, at most 2 s (`MAX_BACKLOG_MS`): a busy client's backlog otherwise
+   still holds keys of the page (seen in GTK at `--delay-ms 0` on a loaded
+   host: 3 of 15 long texts lost characters at page changes).
 
-Why the pause: an X client translates a key event with the keymap it holds
+Why the pauses: an X client translates a key event with the keymap it holds
 when it processes the event, and fetches a changed keymap only when it
 processes the notification of the change. A keycode restored right after its
 key (what this bridge did until 2026-11-12, and what xdotool does) is read
@@ -271,9 +290,13 @@ load more than 20 ms. Chrome also applies a new keymap a little after it reads
 the notification: without the 50 ms before a page's first key, 3 of 12 long
 Chrome texts had one character of a new page typed as the character its
 keycode carried in the previous page (none of 12 with it). The pauses are
-paid once per page (and once at the end), not per character: a text whose
-off-layout characters fit one page costs 250 ms more in total, nothing per
-character.
+paid per page and once at the end, not per character.
+
+Cost (Xvfb, German layout, whole command): ASCII and AltGr characters 12.0
+ms/char at the default 12 ms delay; 100 accented characters in one page 14.4
+ms/char; 200 distinct CJK characters (7 pages of 30) 20.5 ms/char. Claude
+Desktop kills the bridge after 15 s, so a text of distinct CJK characters
+fits about 730 characters.
 
 Which keycodes: Chrome under X11 takes the character from the keysym, so a
 character on a keycode without a DOM code (8) arrives; a character bound to a
@@ -281,16 +304,44 @@ named key's keycode runs that key instead (measured: bound to BackSpace's
 keycode 22, `é` deleted the previous character). Empty keycodes are never
 named keys of the layout.
 
-Safety: before the first change the original rows go to the root-window
-property `_X11_BRIDGE_KEYMAP_RESTORE` (`[1, pid, keysyms_per_keycode,
-(keycode, row...)...]`, CARDINAL/32). `type` stops between two characters on
-SIGTERM / SIGINT / SIGHUP (Node's `execFileSync` timeout sends SIGTERM),
-restores and exits 1 (`typing stopped by signal N after M characters`). After
-a SIGKILL the next `type` / `key-sequence` / `hold-key` restores every
-journaled keycode that still carries a bridge row (one keysym repeated) and
-deletes the property; a journal of a bridge that is still running is left to
-it. Modifier and character keys are pressed and released within one flush per
-character, so no key stays down after a kill.
+### One bridge at a time, and what a crash leaves
+
+- **Lock.** A command that binds keycodes (or finds a journal, below) first
+  owns the selection `_X11_BRIDGE_KEYMAP_LOCK` (taken under a server grab, so
+  two bridges cannot both take it) and keeps it until it has restored. The
+  server drops the ownership when the client disconnects, also after a
+  SIGKILL, so a dead holder never blocks anyone. A second bridge waits up to
+  3 s (`LOCK_WAIT_MS`) and then fails with `another x11-bridge (window 0x...)
+  is changing the keyboard mapping of this display` (exit 1, nothing typed).
+  Claude Desktop runs one input command at a time, so this only happens with
+  two clients or a hung bridge. Commands that bind nothing never take the
+  lock.
+- **Journal.** Only the lock holder writes the root-window property
+  `_X11_BRIDGE_KEYMAP_RESTORE` (`[2, owner window, keysyms_per_keycode,
+  (keycode, original[per], written[per], pending_a, pending_b)...]`,
+  CARDINAL/32): the bound keycodes, the row the server reads back after the
+  binding, and the keysyms of a binding being made. A command that finds a
+  journal takes the lock (its writer is then gone) and restores a keycode
+  only when it still carries exactly the written row, or only keysyms of the
+  pending binding; anything else - a layout loaded in between, a user's
+  `xmodmap` - is left alone. Then it deletes the journal.
+- **Foreign keymap changes.** The bridge selects XKB MapNotify and
+  NewKeyboardNotify on its connection. A notification that is not the echo of
+  its own change makes `type` re-read the layout before the next character;
+  if keys, types or the active group differ (setxkbmap, xmodmap, a
+  compositor's new keymap on XWayland), typing stops with `reason:
+  "keymapChanged"`. The restore at the end only touches keycodes that still
+  carry the bridge's row.
+- **Signals.** `type`, `key-sequence` and `hold-key` catch SIGTERM / SIGINT /
+  SIGHUP (Node's `execFileSync` timeout sends SIGTERM) and stop at the next
+  safe point: `type` between two characters, `hold-key` during its hold (it
+  wakes at once), `key-sequence` between repetitions. Keys are released, the
+  keycodes restored, the result printed (see the contract) and the exit code
+  is 1. A signal that arrives after the last character is no interruption
+  (exit 0). Within a character, modifier and character keys are pressed and
+  released in one flush, so a SIGKILL during `type` or `key-sequence` leaves
+  no key down; a SIGKILL during `hold-key` leaves the held keys down on the
+  XTEST device until something releases them.
 
 ## Escape abort (`abort-watch`)
 
@@ -365,6 +416,11 @@ passive), `null` when unavailable.
 
 - Success: one JSON value on stdout, exit 0 (`abort-watch` excepted, see above).
 - Failure: `anyhow` error chain printed to stderr (`{error:#}`), exit 1.
+- Stopped early (`type` by a signal or a keymap change, `key-sequence` /
+  `hold-key` by a signal): the result JSON with `interrupted: true` on stdout
+  and a line on stderr, exit 1. `charCount` counts the characters (Unicode
+  scalar values) typed from the start of `text`; the caller can type the rest
+  (`Array.from(text).slice(charCount)` in JS) instead of all of it again.
 - Unknown/invalid CLI: clap message on stderr, exit 2.
 - The JS `execBridge` surfaces stderr (or stdout, or `error.message`) as the
   thrown error detail, and special-cases `/already active/i` for session start.

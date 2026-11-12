@@ -108,8 +108,8 @@ failure it prints a message to stderr and exits 1 (clap parse errors exit 2).
 | `zoom --display N --x --y --w --h [--keep-window ID]... [--mask-all] [--ignore-window ID]...` | Capture a region within a monitor (same mask mode) |
 | `pointer-move` / `-click` / `-scroll` / `-drag` | Pointer actions (XTEST) |
 | `left-mouse-down` / `left-mouse-up` | Press/release-and-hold the left button |
-| `key-sequence --keys <spec>` | Send a key combo, e.g. `ctrl+shift+tab` |
-| `type --text <t> [--delay-ms N]` | Type text as key events: the active layout's keys and levels (Shift, AltGr), other characters on spare keycodes ([DESIGN.md](DESIGN.md#typing-and-the-keyboard-layout)) |
+| `key-sequence --keys <spec>` | Send a key combo, e.g. `ctrl+shift+tab` (physical keys: Ctrl+C on an active Russian layout presses the Latin C key) |
+| `type --text <t> [--delay-ms N]` | Type text as key events: the active layout's keys and levels (Shift, AltGr, Caps Lock accounted for), other characters on spare keycodes; stopped early it prints `charCount` with `interrupted: true` and exits 1 ([DESIGN.md](DESIGN.md#typing-and-the-keyboard-layout)) |
 | `hold-key --key <k>... --duration-ms N` | Hold keys for a fixed duration |
 | `cursor-position` / `frontmost-app` / `app-under-point` | Pointer + app queries |
 | `activate-window --window <id>` | Raise + focus a window |

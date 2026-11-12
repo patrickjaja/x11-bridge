@@ -13,30 +13,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   layout): the spare keycode was restored right after the key, before the
   client had read the new mapping. Measured under Xvfb in GTK, urxvt and
   Chrome: all lost at the default delay, the previous character typed instead
-  at `--delay-ms 0`. Such characters are now bound page by page to every
-  keycode with no keysym, typed 50 ms after the binding and restored 200 ms
-  after the last of them, once per page instead of once per character. Below 4 ms per key a page change also
-  waits for a client reading one key per 4 ms to catch up.
+  at `--delay-ms 0`. Such characters are now bound page by page to the
+  keycodes with no keysym (case pairs as `[small, capital]`, two characters
+  without case per keycode), typed 50 ms after the binding and restored
+  200 ms after the last of them, once per page instead of once per
+  character. Below 4 ms per key a page change also waits for a client reading
+  one key per 4 ms to catch up, at most 2 s.
 - `type` uses the layout's AltGr levels (German `@ { [ ] } \ | ~ €` need no
-  remap any more) and honours Caps Lock.
+  remap any more), prefers the main block over the keypad (`(` is Shift+9,
+  not the keypad's parenthesis key) and types exactly the text under Caps
+  Lock: bound case pairs get a key type that uses Lock (set explicitly for
+  Unicode keysyms, where the server would pick TWO_LEVEL), and the clients'
+  own Caps Lock upper-casing is accounted for.
 - With a second layout active (`us,de` switched to `de`), every command
   pressed the first layout's key: `y` came out as `z`, symbols as other
-  symbols or dead keys. Keys are now chosen in the active XKB group
-  (`type`, `key-sequence`, `hold-key`).
-- `key-sequence` / `hold-key` with a key the layout lacks (`key €`) lost it
-  for the same reason as `type`; the binding now stays until 200 ms after the
-  release.
-- A `type` killed mid-text (SIGKILL, or the app's timeout) left a keycode
-  bound to the last character. SIGTERM / SIGINT / SIGHUP now stop it between
-  two characters with the keymap restored; after a SIGKILL the next keyboard
-  command restores it from a root-window journal.
+  symbols or dead keys. Keys are now chosen in the active XKB group.
+- `key-sequence` / `hold-key` press the physical key: on an active Russian
+  layout `ctrl+c` presses the Latin layout's C key (it used to rebind a spare
+  keycode). A key no group has (`key €` on `us`) is bound and kept until
+  200 ms after the release.
+- Two bridges at once could rebind each other's keycodes and leave them
+  bound for good. Binding keycodes now takes a per-display lock (the
+  selection `_X11_BRIDGE_KEYMAP_LOCK`, released by the server when the
+  bridge dies); a second bridge waits up to 3 s, then fails clearly.
+- The restore and the crash recovery only touch keycodes that still carry
+  exactly the row the bridge wrote: a layout loaded meanwhile (setxkbmap,
+  xmodmap, a compositor's keymap on XWayland) is kept. `type` stops with
+  `reason: "keymapChanged"` when the keymap changes under it.
+- A `type` killed by the app's timeout (SIGTERM) restores the keymap and
+  prints its result with `charCount`, `interrupted: true` and `reason` on
+  stdout (exit 1), so the caller can type the rest. A signal after the last
+  character is success. `hold-key` and `key-sequence` stop on SIGTERM too,
+  with the keys released. After a SIGKILL the next keyboard command restores
+  the keycodes from a root-window journal.
 
 ### Tests
 
-- Xvfb: German layout, `us,de` with the second group and more distinct
-  characters than spare keycodes, against a client that reads the keymap
-  lazily (fail on the old code); unit tests for level / group selection and
-  paging. CI installs `x11-xkb-utils` for `setxkbmap`.
+- `tests/type_xvfb.rs` (the built binary against private Xvfbs): Caps Lock
+  and Num Lock text in an Xlib terminal (xterm or urxvt), SIGTERM mid-text,
+  a signal after the last character, SIGKILL recovery, a real key on a
+  journaled keycode after a SIGKILL, two bridges at once, `ctrl+c` on
+  `us,ru`, a foreign keymap change mid-text, SIGTERM during `hold-key`,
+  `(` and `)` from the main block, a 4000-character burst. All but the
+  SIGKILL recovery fail on the previous build.
+- In-crate Xvfb tests: German layout, `us,de` on group 2 and more distinct
+  characters than spare keycodes against a client that reads the keymap
+  lazily; unit tests for levels, groups, Caps Lock, paging, slot reuse and
+  the journal. CI installs `x11-xkb-utils` and `xterm`.
 
 ## 2026-11-11
 

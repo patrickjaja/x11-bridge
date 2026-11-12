@@ -41,6 +41,14 @@ if ! xvfb-run -a -s "-screen 0 1280x800x24" \
   failed+=("abort_watch_xvfb")
 fi
 
+# `type` / `key-sequence` / `hold-key` as the app runs them (the built binary,
+# signals, two bridges at once, Caps Lock in an Xlib terminal): every test
+# starts its own private Xvfb (-displayfd). Needs setxkbmap and xterm (or
+# urxvt).
+if ! env -u DISPLAY -u WAYLAND_DISPLAY cargo test --test type_xvfb -- --ignored --test-threads=1 ${FILTER:+"$FILTER"}; then
+  failed+=("type_xvfb")
+fi
+
 # `app-under-point` under a reparenting window manager: every test starts its
 # own private Xvfb (-displayfd) plus an xfwm4 on its own dbus-daemon and an
 # empty XDG_CONFIG_HOME, so the desktop session is never touched. Needs xfwm4

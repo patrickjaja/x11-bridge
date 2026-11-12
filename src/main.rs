@@ -230,16 +230,42 @@ fn run() -> Result<ExitCode> {
             print_json(&input::pointer::left_mouse_up(&conn)?)?;
         }
         Command::KeySequence { keys, repeat } => {
+            input::keyboard::catch_stop_signals();
             let conn = Conn::connect()?;
-            print_json(&input::keyboard::key_sequence(&conn, &keys, repeat)?)?;
+            let result = input::keyboard::key_sequence(&conn, &keys, repeat)?;
+            print_json(&result)?;
+            if result.interrupted == Some(true) {
+                eprintln!("key-sequence stopped by a signal (keys released)");
+                return Ok(ExitCode::FAILURE);
+            }
         }
         Command::Type { text, delay_ms } => {
+            input::keyboard::catch_stop_signals();
             let conn = Conn::connect()?;
-            print_json(&input::keyboard::type_text(&conn, &text, delay_ms)?)?;
+            let result = input::keyboard::type_text(&conn, &text, delay_ms)?;
+            print_json(&result)?;
+            if result.interrupted == Some(true) {
+                let why = match result.reason.as_deref() {
+                    Some("keymapChanged") => "the keyboard layout changed while typing",
+                    _ => "stopped by a signal",
+                };
+                eprintln!(
+                    "typing incomplete: {why}; typed {} of {} characters",
+                    result.char_count,
+                    text.chars().count()
+                );
+                return Ok(ExitCode::FAILURE);
+            }
         }
         Command::HoldKey { keys, duration_ms } => {
+            input::keyboard::catch_stop_signals();
             let conn = Conn::connect()?;
-            print_json(&input::keyboard::hold_key(&conn, &keys, duration_ms)?)?;
+            let result = input::keyboard::hold_key(&conn, &keys, duration_ms)?;
+            print_json(&result)?;
+            if result.interrupted == Some(true) {
+                eprintln!("hold-key stopped by a signal (keys released)");
+                return Ok(ExitCode::FAILURE);
+            }
         }
     }
 
