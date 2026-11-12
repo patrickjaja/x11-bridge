@@ -5,8 +5,9 @@
 //! `js/cu_linux_executor.js` (the current xdotool-era mapping) — it is the set
 //! of CU key-spec tokens the parser MUST accept. This module resolves each name
 //! (or a literal char) to an X11 keysym value, then to a live keycode via the
-//! server's keyboard mapping (temporarily rebinding a spare keycode for glyphs
-//! not present on the current layout — the xdotool approach).
+//! server's keyboard mapping. Which key and level types a keysym is decided
+//! by [`crate::input::layout`]; glyphs the layout lacks are bound to spare
+//! keycodes by [`crate::input::remap`].
 //!
 //! Key-spec grammar (matches the JS `combo.split("+")`):
 //!   spec        := token ("+" token)*
@@ -44,9 +45,6 @@
 //! matches `"pageup"`/`"pagedown"` (no underscore). CU emits both `page_down`
 //! and `pagedown` historically, so the parser accepts the underscore forms too
 //! (normalized by removing `_`).
-
-use std::thread;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use x11rb::connection::Connection;
@@ -346,23 +344,25 @@ pub fn keysym_for_name(name: &str) -> Result<Keysym> {
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedKey {
     pub keycode: Keycode,
+    /// Kept for callers that type at level 2; the click modifiers and tests
+    /// only need the keycode.
+    #[allow(dead_code)]
     pub needs_shift: bool,
 }
 
 /// The server keyboard mapping (keysyms per keycode over the min..=max range),
 /// used to turn keysyms into keycodes and to find/restore spare keycodes for
 /// off-layout glyphs.
-pub struct KeyboardMap<'a> {
-    conn: &'a Conn,
+pub struct KeyboardMap {
     min_keycode: u8,
     max_keycode: u8,
     keysyms_per_keycode: usize,
     keysyms: Vec<Keysym>,
 }
 
-impl<'a> KeyboardMap<'a> {
+impl KeyboardMap {
     /// Fetch the full keyboard mapping from the server.
-    pub fn fetch(conn: &'a Conn) -> Result<Self> {
+    pub fn fetch(conn: &Conn) -> Result<Self> {
         let setup = conn.conn.setup();
         let min_keycode = setup.min_keycode;
         let max_keycode = setup.max_keycode;
@@ -376,7 +376,6 @@ impl<'a> KeyboardMap<'a> {
             .context("failed to read keyboard mapping reply")?;
 
         Ok(Self {
-            conn,
             min_keycode,
             max_keycode,
             keysyms_per_keycode: usize::from(reply.keysyms_per_keycode),
@@ -434,92 +433,32 @@ impl<'a> KeyboardMap<'a> {
         XKeysym::new(raw).key_char()
     }
 
-    /// A spare keycode usable for temporary remapping: one whose base-group
-    /// columns are all NoSymbol (0), else the last keycode as a scratch slot
-    /// (the xdotool fallback). Returns the keycode's original keysym row so it
-    /// can be restored.
-    fn spare_keycode(&self) -> (u8, Vec<Keysym>) {
-        for keycode in self.min_keycode..=self.max_keycode {
-            let syms = self.syms_for(keycode);
-            if syms.iter().all(|&s| s == 0) {
-                return (keycode, syms.to_vec());
-            }
-        }
-        // No fully-empty keycode: scratch the last one (restored afterward).
-        (self.max_keycode, self.syms_for(self.max_keycode).to_vec())
+    /// Keysyms per keycode in the core mapping.
+    pub fn keysyms_per_keycode(&self) -> usize {
+        self.keysyms_per_keycode
     }
 
-    /// Resolve `keysym` to a keycode, dynamically remapping a spare keycode if
-    /// the keysym is not on the current layout (returns a guard that restores
-    /// the mapping on drop). This is the xdotool approach for exotic glyphs
-    /// ('é', '€', emoji, ...).
-    pub fn resolve_or_remap(
-        &self,
-        keysym: Keysym,
-    ) -> Result<(ResolvedKey, Option<RemapGuard<'a>>)> {
-        if let Some(resolved) = self.keycode_for(keysym) {
-            return Ok((resolved, None));
+    /// Keycodes free for binding off-layout characters, with their rows: every
+    /// keycode without any keysym (no physical key of the layout produces
+    /// it). Without one, the last keycode is borrowed (the xdotool fallback).
+    pub fn spare_keycodes(&self) -> Vec<(u8, Vec<Keysym>)> {
+        let spares: Vec<(u8, Vec<Keysym>)> = (self.min_keycode..=self.max_keycode)
+            .filter(|&keycode| self.syms_for(keycode).iter().all(|&s| s == 0))
+            .map(|keycode| (keycode, self.syms_for(keycode).to_vec()))
+            .collect();
+        if spares.is_empty() {
+            vec![(self.max_keycode, self.syms_for(self.max_keycode).to_vec())]
+        } else {
+            spares
         }
-
-        let (keycode, original) = self.spare_keycode();
-        // Bind the keysym at both base columns so it types without Shift.
-        let mut row = vec![keysym; self.keysyms_per_keycode.max(1)];
-        if row.len() >= 2 {
-            row[1] = keysym;
-        }
-
-        self.conn
-            .conn
-            .change_keyboard_mapping(1, keycode, self.keysyms_per_keycode as u8, &row)
-            .context("failed to remap spare keycode")?;
-        self.conn
-            .conn
-            .flush()
-            .context("failed to flush keyboard remap")?;
-        // Let the server/clients settle on the new mapping (xdotool does this).
-        thread::sleep(Duration::from_millis(12));
-
-        let guard = RemapGuard {
-            conn: self.conn,
-            keycode,
-            keysyms_per_keycode: self.keysyms_per_keycode as u8,
-            original,
-        };
-        Ok((
-            ResolvedKey {
-                keycode,
-                needs_shift: false,
-            },
-            Some(guard),
-        ))
     }
 
     /// The Shift_L keycode, for wrapping keysyms that sit at column 1.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn shift_keycode(&self) -> Result<Keycode> {
         self.keycode_for(xkeysym::key::Shift_L)
             .map(|resolved| resolved.keycode)
             .ok_or_else(|| anyhow!("no keycode bound to Shift_L on this server"))
-    }
-}
-
-/// Restores a temporarily-remapped keycode to its original keysyms on drop.
-pub struct RemapGuard<'a> {
-    conn: &'a Conn,
-    keycode: u8,
-    keysyms_per_keycode: u8,
-    original: Vec<Keysym>,
-}
-
-impl Drop for RemapGuard<'_> {
-    fn drop(&mut self) {
-        // Best-effort restore; log to stderr on failure (we are exiting anyway).
-        let _ = self.conn.conn.change_keyboard_mapping(
-            1,
-            self.keycode,
-            self.keysyms_per_keycode,
-            &self.original,
-        );
-        let _ = self.conn.conn.flush();
     }
 }
 

@@ -836,6 +836,7 @@ dependencies = [
  "cu-abort-watch",
  "cu-atspi",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "x11rb",

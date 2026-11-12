@@ -1,27 +1,52 @@
 //! Keyboard synthesis over XTEST.
 //!
-//! Parses a key spec via [`crate::input::keymap`], presses each modifier
-//! keycode, taps the base key, then releases the modifiers in reverse order
-//! (mirroring the xdotool `keydown/keyup` chording the JS does today). `type`
-//! walks the text char-by-char, mapping each to a keysym (temporarily rebinding
-//! a spare keycode for glyphs not on the current layout) with `delay_ms`
-//! between events. `hold-key` presses keys, sleeps `duration_ms`, releases.
+//! Every command resolves keysyms against the session layout
+//! ([`crate::input::layout`]: active XKB group, Shift and, for `type`, AltGr
+//! levels) and binds what the layout lacks to spare keycodes
+//! ([`crate::input::remap`]). `key-sequence` presses each modifier keycode,
+//! taps the base key, then releases the modifiers in reverse order (mirroring
+//! the xdotool `keydown/keyup` chording the JS does today). `type` walks the
+//! text char-by-char with `delay_ms` between characters. `hold-key` presses
+//! keys, sleeps `duration_ms`, releases.
 
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Keycode};
+use x11rb::protocol::xproto::{KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Keycode, Keysym};
 use x11rb::protocol::xtest::ConnectionExt as _;
 
 use crate::conn::Conn;
 use crate::input::keymap::{KeyboardMap, keysym_for_name, parse_spec};
+use crate::input::layout::{Layout, Stroke};
+use crate::input::remap::{Remapper, plan_pages, recover_stale};
 
 const CURRENT_TIME: u32 = 0;
 const CORE_DEVICE: u8 = 0;
 /// Small settle delay between key-sequence repeats (matches JS `sleep 0.008`).
 const KEY_REPEAT_MS: u64 = 8;
+
+/// Signal that interrupted `type` (0 = none).
+static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_signal(signal: libc::c_int) {
+    INTERRUPTED.store(signal, Ordering::SeqCst);
+}
+
+/// Let SIGTERM / SIGINT / SIGHUP stop `type` between two characters, so the
+/// remapped keycodes are restored before the process exits (the default
+/// action would kill it with them bound).
+fn catch_stop_signals() {
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: the handler only stores into an atomic.
+        unsafe {
+            libc::signal(signal, handler);
+        }
+    }
+}
 
 /// Result of a key-sequence or hold action. Mirrors kwin-portal-bridge's
 /// `KeyboardActionResult`.
@@ -57,6 +82,69 @@ fn fake_key(conn: &Conn, keycode: Keycode, press: bool) -> Result<()> {
     Ok(())
 }
 
+/// Tap one key: press the level modifiers, the key, release in reverse.
+fn tap(conn: &Conn, layout: &Layout, keycode: Keycode, shift: bool, level3: bool) -> Result<()> {
+    let mods: Vec<Keycode> = [
+        layout.shift.filter(|_| shift).map(|m| m.keycode),
+        layout.level3.filter(|_| level3).map(|m| m.keycode),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for &m in &mods {
+        fake_key(conn, m, true)?;
+    }
+    fake_key(conn, keycode, true)?;
+    fake_key(conn, keycode, false)?;
+    for &m in mods.iter().rev() {
+        fake_key(conn, m, false)?;
+    }
+    Ok(())
+}
+
+/// A key of a combo or hold: on the layout (no AltGr, so a shortcut never
+/// gains a modifier; Caps Lock ignored), else bound to a spare keycode.
+enum ComboKey {
+    Layout(Stroke),
+    Bound(Keysym),
+}
+
+fn combo_key(layout: &Layout, keysym: Keysym) -> ComboKey {
+    match layout.find_shortcut(keysym) {
+        Some(stroke) => ComboKey::Layout(stroke),
+        None => ComboKey::Bound(keysym),
+    }
+}
+
+/// Bind the keysyms of `keys` the layout lacks, then return each key as a
+/// keycode plus whether Shift is needed.
+fn combo_keycodes(remapper: &mut Remapper, keys: &[ComboKey]) -> Result<Vec<(Keycode, bool)>> {
+    let mut bound: Vec<Keysym> = Vec::new();
+    for key in keys {
+        if let ComboKey::Bound(sym) = key
+            && !bound.contains(sym)
+        {
+            bound.push(*sym);
+        }
+    }
+    if bound.len() > remapper.capacity() {
+        bail!("not enough spare keycodes for this key combination");
+    }
+    if !bound.is_empty() {
+        remapper.load(&bound)?;
+        remapper.mark_used();
+    }
+    keys.iter()
+        .map(|key| match key {
+            ComboKey::Layout(stroke) => Ok((stroke.keycode, stroke.shift)),
+            ComboKey::Bound(sym) => remapper
+                .keycode_of(*sym)
+                .map(|keycode| (keycode, false))
+                .ok_or_else(|| anyhow!("spare keycode binding failed")),
+        })
+        .collect()
+}
+
 /// Send an executor-style key sequence such as `ctrl+shift+tab`, `repeat` times.
 ///
 /// The `keys` field of the result is the raw split tokens (trimmed, non-empty),
@@ -65,53 +153,40 @@ pub fn key_sequence(conn: &Conn, keys: &str, repeat: Option<u32>) -> Result<Keyb
     let spec = parse_spec(keys)?;
     let repeat = repeat.unwrap_or(1).max(1);
 
+    recover_stale(conn)?;
+    let layout = Layout::fetch(conn)?;
     let map = KeyboardMap::fetch(conn)?;
+    let mut remapper = Remapper::new(conn, &map);
 
-    // Resolve modifiers to keycodes up front.
-    let mut modifier_keycodes = Vec::with_capacity(spec.modifiers.len());
+    // Resolve modifiers and the base key up front (modifiers first, base last).
+    let mut combo = Vec::with_capacity(spec.modifiers.len() + 1);
     for name in &spec.modifiers {
         let keysym = keysym_for_name(name)?;
-        let resolved = map
-            .keycode_for(keysym)
-            .ok_or_else(|| anyhow::anyhow!("no keycode for modifier `{name}`"))?;
-        modifier_keycodes.push(resolved.keycode);
+        match layout.find_shortcut(keysym) {
+            Some(stroke) => combo.push(ComboKey::Layout(stroke)),
+            None => bail!("no keycode for modifier `{name}`"),
+        }
     }
-
-    let base_keysym = keysym_for_name(&spec.base)?;
-    let shift_keycode = map.shift_keycode().ok();
+    combo.push(combo_key(&layout, keysym_for_name(&spec.base)?));
+    let keycodes = combo_keycodes(&mut remapper, &combo)?;
+    let (&(base, base_shift), modifiers) = keycodes.split_last().expect("base key");
 
     for i in 0..repeat {
         if i > 0 {
             conn.conn.flush().ok();
             thread::sleep(Duration::from_millis(KEY_REPEAT_MS));
         }
-
-        // Press modifiers in order.
-        for &keycode in &modifier_keycodes {
+        for &(keycode, _) in modifiers {
             fake_key(conn, keycode, true)?;
         }
-
-        // Resolve the base key (dynamic remap for off-layout glyphs).
-        let (resolved, _guard) = map.resolve_or_remap(base_keysym)?;
-        let needs_shift = resolved.needs_shift && shift_keycode.is_some();
-        if needs_shift {
-            fake_key(conn, shift_keycode.unwrap(), true)?;
-        }
-        fake_key(conn, resolved.keycode, true)?;
-        fake_key(conn, resolved.keycode, false)?;
-        if needs_shift {
-            fake_key(conn, shift_keycode.unwrap(), false)?;
-        }
-        // _guard restores any remapped keycode here, after release.
+        tap(conn, &layout, base, base_shift, false)?;
         conn.conn.flush().ok();
-
-        // Release modifiers in reverse order.
-        for &keycode in modifier_keycodes.iter().rev() {
+        for &(keycode, _) in modifiers.iter().rev() {
             fake_key(conn, keycode, false)?;
         }
     }
-
     conn.sync()?;
+    remapper.finish()?;
 
     // Echo the raw split tokens, like the kwin bridge does.
     let echoed: Vec<String> = keys
@@ -130,23 +205,22 @@ pub fn key_sequence(conn: &Conn, keys: &str, repeat: Option<u32>) -> Result<Keyb
 }
 
 /// Type `text` as individual key events, `delay_ms` apart. Handles '\n' ->
-/// Return, '\t' -> Tab, and off-layout glyphs (accents, symbols, emoji) via a
-/// temporary keycode remap.
+/// Return, '\t' -> Tab. Characters on the layout use their key and level
+/// (Shift, AltGr); the rest are bound to spare keycodes page by page (see
+/// [`crate::input::remap`]).
 pub fn type_text(conn: &Conn, text: &str, delay_ms: u64) -> Result<TypeActionResult> {
+    catch_stop_signals();
+    recover_stale(conn)?;
+    let layout = Layout::fetch(conn)?;
     let map = KeyboardMap::fetch(conn)?;
-    let shift_keycode = map.shift_keycode().ok();
+    let mut remapper = Remapper::new(conn, &map);
 
-    let mut char_count = 0usize;
-    for (i, ch) in text.chars().enumerate() {
-        if i > 0 && delay_ms > 0 {
-            thread::sleep(Duration::from_millis(delay_ms));
-        }
-
-        // Resolve special chars to their keysym name; everything else via char.
+    // Resolve every character before the first key.
+    let mut plan: Vec<(Keysym, Option<Stroke>)> = Vec::new();
+    for ch in text.chars() {
         let keysym = match ch {
-            '\n' => keysym_for_name("return")?,
+            '\n' | '\r' => keysym_for_name("return")?,
             '\t' => keysym_for_name("tab")?,
-            '\r' => keysym_for_name("return")?,
             other => {
                 let ks = xkeysym::Keysym::from_char(other);
                 if ks == xkeysym::Keysym::NoSymbol {
@@ -158,23 +232,49 @@ pub fn type_text(conn: &Conn, text: &str, delay_ms: u64) -> Result<TypeActionRes
                 ks.raw()
             }
         };
+        plan.push((keysym, layout.find(keysym, true)));
+    }
+    let needs: Vec<Option<Keysym>> = plan
+        .iter()
+        .map(|&(keysym, stroke)| stroke.is_none().then_some(keysym))
+        .collect();
+    let mut pages = plan_pages(&needs, remapper.capacity())
+        .into_iter()
+        .peekable();
 
-        let (resolved, _guard) = map.resolve_or_remap(keysym)?;
-        let needs_shift = resolved.needs_shift && shift_keycode.is_some();
-        if needs_shift {
-            fake_key(conn, shift_keycode.unwrap(), true)?;
+    let mut char_count = 0usize;
+    for (i, &(keysym, stroke)) in plan.iter().enumerate() {
+        if INTERRUPTED.load(Ordering::SeqCst) != 0 {
+            break;
         }
-        fake_key(conn, resolved.keycode, true)?;
-        fake_key(conn, resolved.keycode, false)?;
-        if needs_shift {
-            fake_key(conn, shift_keycode.unwrap(), false)?;
+        if i > 0 && delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+        if pages.peek().is_some_and(|(start, _)| *start == i) {
+            let (_, page) = pages.next().expect("peeked");
+            remapper.load(&page)?;
+        }
+        match stroke {
+            Some(stroke) => tap(conn, &layout, stroke.keycode, stroke.shift, stroke.level3)?,
+            None => {
+                let keycode = remapper
+                    .keycode_of(keysym)
+                    .ok_or_else(|| anyhow!("keysym {keysym:#x} is not bound"))?;
+                tap(conn, &layout, keycode, false, false)?;
+                remapper.mark_used();
+            }
         }
         conn.conn.flush().ok();
-        // _guard restores a remapped keycode here (after the char is delivered).
         char_count += 1;
     }
 
     conn.sync()?;
+    remapper.finish()?;
+
+    let signal = INTERRUPTED.load(Ordering::SeqCst);
+    if signal != 0 {
+        bail!("typing stopped by signal {signal} after {char_count} characters");
+    }
 
     Ok(TypeActionResult {
         action: "type".to_owned(),
@@ -191,8 +291,10 @@ pub fn hold_key(conn: &Conn, keys: &[String], duration_ms: u64) -> Result<Keyboa
         bail!("hold key list is empty");
     }
 
+    recover_stale(conn)?;
+    let layout = Layout::fetch(conn)?;
     let map = KeyboardMap::fetch(conn)?;
-    let shift_keycode = map.shift_keycode().ok();
+    let mut remapper = Remapper::new(conn, &map);
 
     // Sort so modifiers are pressed before non-modifiers, preserving relative
     // order within each group (a stable partition).
@@ -208,33 +310,22 @@ pub fn hold_key(conn: &Conn, keys: &[String], duration_ms: u64) -> Result<Keyboa
         }
     }
 
-    // Resolve every key to a keycode (+ shift level), holding remap guards for
-    // the whole duration so off-layout glyphs stay bound while held.
-    struct Held {
-        keycode: Keycode,
-        shift: bool,
-    }
-    let mut held: Vec<Held> = Vec::with_capacity(ordered.len());
-    let mut guards = Vec::new();
+    // Resolve every key to a keycode (+ shift level); off-layout glyphs stay
+    // bound for the whole duration.
+    let mut combo = Vec::with_capacity(ordered.len());
     for key in &ordered {
-        let keysym = keysym_for_name(key)?;
-        let (resolved, guard) = map.resolve_or_remap(keysym)?;
-        if let Some(guard) = guard {
-            guards.push(guard);
-        }
-        held.push(Held {
-            keycode: resolved.keycode,
-            shift: resolved.needs_shift && shift_keycode.is_some(),
-        });
+        combo.push(combo_key(&layout, keysym_for_name(key)?));
     }
+    let held = combo_keycodes(&mut remapper, &combo)?;
 
     // Press: shift (if any key needs it), then each key in order.
-    let any_shift = held.iter().any(|h| h.shift);
+    let shift = layout.shift.map(|m| m.keycode);
+    let any_shift = shift.is_some() && held.iter().any(|&(_, s)| s);
     if any_shift {
-        fake_key(conn, shift_keycode.unwrap(), true)?;
+        fake_key(conn, shift.unwrap(), true)?;
     }
-    for h in &held {
-        fake_key(conn, h.keycode, true)?;
+    for &(keycode, _) in &held {
+        fake_key(conn, keycode, true)?;
     }
     conn.conn
         .flush()
@@ -243,17 +334,14 @@ pub fn hold_key(conn: &Conn, keys: &[String], duration_ms: u64) -> Result<Keyboa
     thread::sleep(Duration::from_millis(duration_ms));
 
     // Release in reverse order, then shift.
-    for h in held.iter().rev() {
-        fake_key(conn, h.keycode, false)?;
+    for &(keycode, _) in held.iter().rev() {
+        fake_key(conn, keycode, false)?;
     }
     if any_shift {
-        fake_key(conn, shift_keycode.unwrap(), false)?;
+        fake_key(conn, shift.unwrap(), false)?;
     }
-    // Drop the remap guards first (each queues its keymap-restore), then a
-    // single round-trip guarantees the release events AND the restores are
-    // processed by the server before this one-shot process exits.
-    drop(guards);
     conn.sync()?;
+    remapper.finish()?;
 
     Ok(KeyboardActionResult {
         action: "hold-key".to_owned(),

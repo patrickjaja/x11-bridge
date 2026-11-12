@@ -229,6 +229,59 @@ keyname  := <CU key-name from table> | <single literal char>
 The authoritative starting table lives in `src/input/keymap.rs`
 (`CU_KEY_NAMES`, `MODIFIER_TOKENS`).
 
+## Typing and the keyboard layout
+
+`type`, `key-sequence` and `hold-key` turn keysyms into key presses in two
+steps (`src/input/layout.rs`, `src/input/remap.rs`):
+
+1. **On the layout.** The XKB map and state (`XkbGetMap`, `XkbGetState`) say,
+   for the effective group, which key and level produce a keysym. A level is
+   chosen by the key type's modifier map with the locked modifiers (Caps Lock,
+   Num Lock) included, and is selected by holding the layout's own Shift key
+   and, for `type` only, its ISO_Level3_Shift (AltGr) key - both found as keys
+   whose level-1 keysym is the modifier and which the modifier map binds.
+   Preference: no modifier, Shift, AltGr, AltGr+Shift; lowest keycode within
+   one choice. `key-sequence` and `hold-key` never use AltGr, so a shortcut
+   never gains a modifier. Dead keys are never pressed: `^` on a German layout
+   is `dead_circumflex`, a different keysym, so it takes step 2. Without XKB
+   the core mapping is used (group 1, levels 1-2).
+2. **Spare keycodes.** Characters no key of the active group produces are
+   bound to keycodes with no keysym in any column (no physical key of the
+   layout sends them; Xvfb's German layout has 15: 8, 97, 103, ...; with none
+   the last keycode is borrowed). A text is split into pages of at most that
+   many distinct characters; a page's characters are bound before its first
+   key, and the keycodes change again only 200 ms (`SETTLE_MS`) after the last
+   key typed with them - for the next page or for the restore at the end.
+
+Why the pause: an X client translates a key event with the keymap it holds
+when it processes the event, and fetches a changed keymap only when it
+processes the notification of the change. A keycode restored right after its
+key (what this bridge did until 2026-11-12, and what xdotool does) is read
+with the restored map by every client that gets to the event after the
+restore. Measured under Xvfb with GTK 3, urxvt and Chrome 157: every such
+character was lost at the default 12 ms delay; with no delay the previous
+character came out instead. GTK and urxvt needed 1 ms of pause, Chrome under
+load more than 20 ms. The pause is paid once per page (and once at the end),
+not per character: a text whose off-layout characters fit one page costs
+200 ms more in total, nothing per character.
+
+Which keycodes: Chrome under X11 takes the character from the keysym, so a
+character on a keycode without a DOM code (8) arrives; a character bound to a
+named key's keycode runs that key instead (measured: bound to BackSpace's
+keycode 22, `é` deleted the previous character). Empty keycodes are never
+named keys of the layout.
+
+Safety: before the first change the original rows go to the root-window
+property `_X11_BRIDGE_KEYMAP_RESTORE` (`[1, pid, keysyms_per_keycode,
+(keycode, row...)...]`, CARDINAL/32). `type` stops between two characters on
+SIGTERM / SIGINT / SIGHUP (Node's `execFileSync` timeout sends SIGTERM),
+restores and exits 1 (`typing stopped by signal N after M characters`). After
+a SIGKILL the next `type` / `key-sequence` / `hold-key` restores every
+journaled keycode that still carries a bridge row (one keysym repeated) and
+deletes the property; a journal of a bridge that is still running is left to
+it. Modifier and character keys are pressed and released within one flush per
+character, so no key stays down after a kill.
+
 ## Escape abort (`abort-watch`)
 
 The one long-running subcommand: Claude Desktop spawns `x11-bridge abort-watch`
@@ -360,8 +413,9 @@ without changing its parsing.
   first.
 - **input** - XTEST (`xtest_fake_input`): motion (absolute root), button
   press/release (buttons 1/3/2; scroll 4/5/6/7), key press/release. `keymap`
-  resolves keysyms and finds keycodes from the server keyboard mapping
-  (temporarily rebinding a spare keycode for off-layout glyphs when typing).
+  parses key specs to keysyms; `layout` finds their key and level in the
+  active XKB group and `remap` binds the rest to spare keycodes (see
+  [Typing and the keyboard layout](#typing-and-the-keyboard-layout)).
 - **wm** - EWMH/ICCCM root + per-window properties: `_NET_CLIENT_LIST_STACKING`
   (stacking order, bottom→top), `_NET_ACTIVE_WINDOW` (frontmost), `WM_CLASS`
   (`resource_name` = instance, `resource_class` = class), `_NET_WM_NAME` (UTF-8,

@@ -106,7 +106,7 @@ jobs:
       - name: Install Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb xfwm4 xfconf dbus-daemon
+          sudo apt-get install -y --no-install-recommends xvfb x11-xkb-utils xfwm4 xfconf dbus-daemon
 
       - name: cargo build (release)
         run: cargo build --release --locked --target x86_64-unknown-linux-musl

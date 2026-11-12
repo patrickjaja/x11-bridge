@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-11-12
+
+### Fixed
+
+- `type` lost every character the layout has no key for at levels 1-2 (on a
+  German layout `@ { [ ] } \ | ~ € ^ ´ \``, plus accents, emoji, CJK on any
+  layout): the spare keycode was restored right after the key, before the
+  client had read the new mapping. Measured under Xvfb in GTK, urxvt and
+  Chrome: all lost at the default delay, the previous character typed instead
+  at `--delay-ms 0`. Such characters are now bound page by page to every
+  keycode with no keysym and restored 200 ms after the last of them, once per
+  page instead of once per character.
+- `type` uses the layout's AltGr levels (German `@ { [ ] } \ | ~ €` need no
+  remap any more) and honours Caps Lock.
+- With a second layout active (`us,de` switched to `de`), every command
+  pressed the first layout's key: `y` came out as `z`, symbols as other
+  symbols or dead keys. Keys are now chosen in the active XKB group
+  (`type`, `key-sequence`, `hold-key`).
+- `key-sequence` / `hold-key` with a key the layout lacks (`key €`) lost it
+  for the same reason as `type`; the binding now stays until 200 ms after the
+  release.
+- A `type` killed mid-text (SIGKILL, or the app's timeout) left a keycode
+  bound to the last character. SIGTERM / SIGINT / SIGHUP now stop it between
+  two characters with the keymap restored; after a SIGKILL the next keyboard
+  command restores it from a root-window journal.
+
+### Tests
+
+- Xvfb: German layout, `us,de` with the second group and more distinct
+  characters than spare keycodes, against a client that reads the keymap
+  lazily (fail on the old code); unit tests for level / group selection and
+  paging. CI installs `x11-xkb-utils` for `setxkbmap`.
+
 ## 2026-11-11
 
 ### Fixed

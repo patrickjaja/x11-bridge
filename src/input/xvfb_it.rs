@@ -290,3 +290,177 @@ fn drag_presses_moves_and_releases() {
 
     conn.conn.destroy_window(win).ok();
 }
+
+/// Load an XKB layout into the test server with `setxkbmap` (and lock
+/// `group`). `holder` keeps a connection open: Xvfb resets its keymap when the
+/// last client disconnects.
+fn load_layout(holder: &Conn, layout: &str, group: u8) {
+    use x11rb::protocol::xkb::{ConnectionExt as _, Group, ID};
+    let status = std::process::Command::new("setxkbmap")
+        .args(["-layout", layout])
+        .status()
+        .expect("run setxkbmap (x11-xkb-utils)");
+    assert!(status.success(), "setxkbmap -layout {layout} failed");
+    holder
+        .conn
+        .xkb_use_extension(1, 0)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let group = match group {
+        0 => Group::M1,
+        1 => Group::M2,
+        2 => Group::M3,
+        _ => Group::M4,
+    };
+    holder
+        .conn
+        .xkb_latch_lock_state(
+            ID::USE_CORE_KBD.into(),
+            0u8.into(),
+            0u8.into(),
+            true,
+            group,
+            0u8.into(),
+            false,
+            0,
+        )
+        .unwrap();
+    holder.sync().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+}
+
+/// A text sink that translates keys like an Xlib/XKB client: with the keymap
+/// it holds, fetched again only when it processes the first key event after a
+/// mapping notification - and it is busy for `lag` when the first
+/// notification of a change arrives, like a client that is drawing. Returns
+/// the text it read once `expect_chars` characters arrived or `timeout` ran
+/// out.
+fn lazy_client_text(text: &str, delay_ms: u64, lag: Duration, timeout: Duration) -> String {
+    use crate::input::layout::Layout;
+    use std::sync::mpsc;
+    use x11rb::protocol::xkb::{self, ConnectionExt as _};
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let expect_chars = text.chars().count();
+    let client = std::thread::spawn(move || {
+        let conn = Conn::connect().expect("client connect");
+        conn.conn.xkb_use_extension(1, 0).unwrap().reply().unwrap();
+        // An XKB client hears about keymap changes through XKB events.
+        let events = xkb::EventType::MAP_NOTIFY | xkb::EventType::NEW_KEYBOARD_NOTIFY;
+        conn.conn
+            .xkb_select_events(
+                xkb::ID::USE_CORE_KBD.into(),
+                0u16.into(),
+                events,
+                0xffu16.into(),
+                0xffu16.into(),
+                &xkb::SelectEventsAux::new(),
+            )
+            .unwrap();
+        let win = make_focused_window(&conn, EventMask::KEY_PRESS | EventMask::KEY_RELEASE);
+        let mut layout = Layout::fetch(&conn).unwrap();
+        let mut stale = false;
+        let mut out = String::new();
+        ready_tx.send(()).unwrap();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline && out.chars().count() < expect_chars {
+            let Ok(Some(event)) = conn.conn.poll_for_event() else {
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            };
+            match event {
+                Event::MappingNotify(_)
+                | Event::XkbMapNotify(_)
+                | Event::XkbNewKeyboardNotify(_) => {
+                    if !stale {
+                        std::thread::sleep(lag);
+                    }
+                    stale = true;
+                }
+                Event::KeyPress(kp) => {
+                    if stale {
+                        layout = Layout::fetch(&conn).unwrap();
+                        stale = false;
+                    }
+                    let state = u16::from(kp.state);
+                    let keysym = layout.keysym_at(
+                        kp.detail,
+                        (state & 0xff) as u8,
+                        ((state >> 13) & 3) as u8,
+                    );
+                    if keysym == xkeysym::key::Return {
+                        out.push('\n');
+                    } else if let Some(ch) = xkeysym::Keysym::new(keysym).key_char() {
+                        out.push(ch);
+                    }
+                }
+                _ => {}
+            }
+        }
+        conn.conn.destroy_window(win).ok();
+        conn.sync().ok();
+        out
+    });
+    ready_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let typer = Conn::connect().expect("typer connect");
+    keyboard::type_text(&typer, text, delay_ms).expect("type text");
+    client.join().unwrap()
+}
+
+/// German layout: AltGr characters, dead-key characters, characters on no key
+/// and Return reach a client that reads the keymap lazily and is busy when a
+/// mapping changes - at the app's default delay and at none. The old
+/// per-character remap and restore lost every off-layout character here.
+#[test]
+#[ignore = "requires a live X server; run under scripts/test-xvfb.sh"]
+fn type_text_german_layout_reaches_a_lazy_client() {
+    let holder = Conn::connect().expect("connect to Xvfb");
+    load_layout(&holder, "de", 0);
+    let text = "aZ yz @€{}[]\\|~ ^´` éñ😀中ß Ä?\n+-_/#'\";:<>!=*%&()$";
+    for delay in [12, 0] {
+        let got = lazy_client_text(
+            text,
+            delay,
+            Duration::from_millis(40),
+            Duration::from_secs(15),
+        );
+        assert_eq!(got, text, "de layout, delay {delay} ms");
+    }
+    // No keycode is left bound and the journal is gone.
+    let map = KeyboardMap::fetch(&holder).unwrap();
+    assert!(map.spare_keycodes().len() > 1, "spare keycodes left bound");
+    load_layout(&holder, "us", 0);
+}
+
+/// Two layouts with the second active: the key is chosen in the active group
+/// (the core map describes group 1 only, so `y` used to come out as `z`).
+#[test]
+#[ignore = "requires a live X server; run under scripts/test-xvfb.sh"]
+fn type_text_second_group_types_the_active_layout() {
+    let holder = Conn::connect().expect("connect to Xvfb");
+    load_layout(&holder, "us,de", 1);
+    let text = "yzYZ @{}\\ äöü ^`'";
+    let got = lazy_client_text(text, 12, Duration::from_millis(40), Duration::from_secs(10));
+    load_layout(&holder, "us", 0);
+    assert_eq!(got, text, "us,de with de active");
+}
+
+/// More distinct off-layout characters than spare keycodes: the text is typed
+/// in pages and arrives intact.
+#[test]
+#[ignore = "requires a live X server; run under scripts/test-xvfb.sh"]
+fn type_text_pages_many_distinct_characters() {
+    let holder = Conn::connect().expect("connect to Xvfb");
+    load_layout(&holder, "de", 0);
+    let spares = KeyboardMap::fetch(&holder).unwrap().spare_keycodes().len();
+    let text: String = ('\u{0391}'..='\u{03a9}')
+        .chain('\u{0430}'..='\u{044f}')
+        .filter(|c| !c.is_control())
+        .take(spares * 2 + 5)
+        .collect();
+    let got = lazy_client_text(&text, 0, Duration::from_millis(40), Duration::from_secs(15));
+    load_layout(&holder, "us", 0);
+    assert_eq!(got, text);
+}
